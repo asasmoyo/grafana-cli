@@ -1,12 +1,70 @@
 package main
 
 import (
+	"embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 )
+
+//go:embed skill/SKILL.md
+var skillContent embed.FS
+
+func installSkill(targetPath string) {
+	if targetPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fatal("finding home directory: %v", err)
+		}
+		targetPath = filepath.Join(home, ".claude", "skills", "grafana", "SKILL.md")
+	}
+
+	// Expand ~ to home directory
+	if strings.HasPrefix(targetPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fatal("finding home directory: %v", err)
+		}
+		targetPath = filepath.Join(home, targetPath[2:])
+	}
+
+	skillPath := targetPath
+
+	// Check if already installed
+	if _, err := os.Stat(skillPath); err == nil {
+		fmt.Printf("Skill already exists at %s\n", skillPath)
+		fmt.Print("Overwrite? [y/N] ")
+		var answer string
+		fmt.Scanln(&answer)
+		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+			fmt.Println("Skipped.")
+			return
+		}
+	}
+
+	content, err := skillContent.ReadFile("skill/SKILL.md")
+	if err != nil {
+		fatal("reading embedded skill: %v", err)
+	}
+
+	skillDir := filepath.Dir(skillPath)
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		fatal("creating directory %s: %v", skillDir, err)
+	}
+
+	if err := os.WriteFile(skillPath, content, 0644); err != nil {
+		fatal("writing skill file: %v", err)
+	}
+
+	fmt.Printf("Installed skill to %s\n", skillPath)
+	fmt.Println()
+	fmt.Println("Make sure these environment variables are available to your agent:")
+	fmt.Println("  GRAFANA_URL    — Grafana base URL (e.g. https://grafana.example.com)")
+	fmt.Println("  GRAFANA_TOKEN  — Grafana Service Account token")
+}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `grafana-cli — Query Grafana datasources (Prometheus, Loki, Tempo)
@@ -16,6 +74,7 @@ ENVIRONMENT:
   GRAFANA_TOKEN  Service Account token (Bearer token)
 
 COMMANDS:
+  install-skill [path]                     Install agent skill file (default: ~/.claude/skills/grafana/SKILL.md)
   datasources                              List all configured datasources
 
   prom query <datasource> <promql>         Instant PromQL query
@@ -105,6 +164,16 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		usage()
+	}
+
+	// Handle commands that don't need Grafana credentials
+	if args[0] == "install-skill" {
+		path := ""
+		if len(args) > 1 {
+			path = args[1]
+		}
+		installSkill(path)
+		return
 	}
 
 	gc, err := NewGrafanaClient()
