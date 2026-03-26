@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,10 +37,30 @@ func NewGrafanaClient() (*GrafanaClient, error) {
 	if token == "" {
 		return nil, fmt.Errorf("GRAFANA_TOKEN environment variable is required (Service Account token)")
 	}
+
+	// Optional IAP authentication
+	iapClientID := os.Getenv("GRAFANA_IAP_CLIENT_ID")
+	iapSA := os.Getenv("GRAFANA_IAP_SA")
+	switch {
+	case iapClientID != "" && iapSA == "":
+		return nil, fmt.Errorf("both GRAFANA_IAP_CLIENT_ID and GRAFANA_IAP_SA must be set (got only GRAFANA_IAP_CLIENT_ID)")
+	case iapClientID == "" && iapSA != "":
+		return nil, fmt.Errorf("both GRAFANA_IAP_CLIENT_ID and GRAFANA_IAP_SA must be set (got only GRAFANA_IAP_SA)")
+	}
+
+	httpClient := &http.Client{Timeout: requestTimeout}
+	if iapClientID != "" {
+		iapToken, err := getIAPToken(context.Background(), iapClientID, iapSA)
+		if err != nil {
+			return nil, fmt.Errorf("obtaining IAP token: %w", err)
+		}
+		httpClient.Transport = &iapTransport{iapToken: iapToken, base: http.DefaultTransport}
+	}
+
 	return &GrafanaClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
-		client:  &http.Client{Timeout: requestTimeout},
+		client:  httpClient,
 	}, nil
 }
 

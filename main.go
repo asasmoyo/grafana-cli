@@ -70,8 +70,10 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `grafana-cli — Query Grafana datasources (Prometheus, Loki, Tempo)
 
 ENVIRONMENT:
-  GRAFANA_URL    Grafana base URL (e.g. https://grafana.example.com)
-  GRAFANA_TOKEN  Service Account token (Bearer token)
+  GRAFANA_URL            Grafana base URL (e.g. https://grafana.example.com)
+  GRAFANA_TOKEN          Service Account token (Bearer token)
+  GRAFANA_IAP_CLIENT_ID  Google Cloud IAP OAuth Client ID (optional, for IAP-protected Grafana)
+  GRAFANA_IAP_SA         Service account to impersonate for IAP auth (optional, requires gcloud CLI)
 
 COMMANDS:
   install-skill [path]                     Install agent skill file (default: ~/.claude/skills/grafana/SKILL.md)

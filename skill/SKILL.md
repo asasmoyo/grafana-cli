@@ -13,6 +13,8 @@ Query Prometheus metrics, Loki logs, and Tempo traces from your Grafana instance
 - Environment variables must be set:
   - `GRAFANA_URL` — Grafana base URL (e.g. `https://grafana.example.com` or `http://localhost:3000`)
   - `GRAFANA_TOKEN` — Grafana Service Account token
+  - `GRAFANA_IAP_CLIENT_ID` — Google Cloud IAP OAuth Client ID (optional, only if Grafana is behind IAP)
+  - `GRAFANA_IAP_SA` — Service account to impersonate for IAP auth (optional, requires `gcloud` CLI)
 
 ## Discover Your Datasources
 
@@ -109,6 +111,17 @@ When investigating a production issue, follow this order:
 5. **Check resource usage** — `grafana-cli prom query-range <ds> 'sum(rate(container_cpu_usage_seconds_total{namespace="<ns>"}[5m])) by (pod)' --start 1h --step 5m`
 6. **Find slow traces** — `grafana-cli tempo search <ds> --query '{ duration > 1s }' --start 1h --limit 10`
 7. **Drill into a trace** — `grafana-cli tempo trace <ds> <traceID>`
+
+## IAP-Protected Grafana
+
+If your Grafana instance is behind Google Cloud Identity-Aware Proxy, set both IAP variables:
+
+```bash
+export GRAFANA_IAP_CLIENT_ID="123456-abc.apps.googleusercontent.com"
+export GRAFANA_IAP_SA="my-sa@my-project.iam.gserviceaccount.com"
+```
+
+This uses `gcloud auth print-identity-token` to mint an ID token. The IAP token is sent via `Proxy-Authorization` header while the Grafana token uses the standard `Authorization` header.
 
 ## Tips
 

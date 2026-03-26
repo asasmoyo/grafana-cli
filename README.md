@@ -31,6 +31,15 @@ export GRAFANA_URL="https://grafana.example.com"
 export GRAFANA_TOKEN="glsa_xxxxxxxxxxxxxxxxxxxx"
 ```
 
+If your Grafana is behind Google Cloud IAP, also set:
+
+```bash
+export GRAFANA_IAP_CLIENT_ID="123456-abc.apps.googleusercontent.com"
+export GRAFANA_IAP_SA="my-sa@my-project.iam.gserviceaccount.com"
+```
+
+This requires the `gcloud` CLI. The tool mints an IAP ID token via service account impersonation and sends it alongside the Grafana token using dual-header auth.
+
 ## Usage
 
 ```bash
