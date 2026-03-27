@@ -67,7 +67,7 @@ func installSkill(targetPath string) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `grafana-cli — Query Grafana datasources (Prometheus, Loki, Tempo)
+	fmt.Fprintf(os.Stderr, `grafana-cli — Query Grafana datasources (Prometheus, Loki, Tempo, Google Cloud Monitoring)
 
 ENVIRONMENT:
   GRAFANA_URL            Grafana base URL (e.g. https://grafana.example.com)
@@ -112,6 +112,14 @@ COMMANDS:
     [--start <time>] [--end <time>]
     [--limit <n>]
 
+  gcm query <datasource> <promql>          GCM PromQL query (via Grafana)
+    --project <project>                    GCP project ID (required)
+    [--start <time>] [--end <time>]        Times: unix timestamp or relative (1h, 30m, 2d)
+    [--step <step>]                        Step: 10s, 60s, 5m, etc. (default: 60s)
+    [--format tsv]                         Output as TSV (timestamp\tvalue)
+
+  gcm projects <datasource>                List GCP projects for a GCM datasource
+
 EXAMPLES:
   grafana-cli datasources
   grafana-cli prom query prometheus 'up'
@@ -124,15 +132,25 @@ EXAMPLES:
   grafana-cli loki labels loki
   grafana-cli tempo trace tempo abc123def456
   grafana-cli tempo search tempo --query '{ .http.status_code = 500 }' --start 1h
+  grafana-cli gcm projects "Google Cloud Monitoring"
+  grafana-cli gcm query "Google Cloud Monitoring" 'compute_googleapis_com:instance_cpu_utilization' --project time-entries-live --start 1h
+  grafana-cli gcm query "Google Cloud Monitoring" 'avg by (zone) (compute_googleapis_com:instance_cpu_utilization)' --project time-entries-live --start 1h --step 5m
 
 TIME FORMATS:
   Relative:     30m, 1h, 2d (lookback from now)
-  Unix seconds: 1774452000 (auto-converted to nanos for Loki)
+  Unix seconds: 1774452000 (auto-converted to nanos for Loki, millis for GCM)
   Unix nanos:   1774452000000000000
 
 DATASOURCE ARGUMENT:
   Can be a datasource name (or partial match), ID number, or type name.
   Use 'datasources' command to see what's available.
+
+GCM METRIC NAMING:
+  GCM metrics use service_com:metric_name format in PromQL:
+    compute_googleapis_com:instance_cpu_utilization
+    cloudsql_googleapis_com:database_cpu_utilization
+    run_googleapis_com:request_count
+    loadbalancing_googleapis_com:https_request_count
 `)
 	os.Exit(1)
 }
@@ -438,6 +456,57 @@ func main() {
 
 		default:
 			fatal("unknown tempo subcommand: %s (use trace, search)", subcmd)
+		}
+
+	case "gcm", "cloudmonitoring":
+		if len(args) == 0 {
+			fatal("usage: grafana-cli gcm <query|projects> <datasource> ...")
+		}
+		subcmd := args[0]
+		args = args[1:]
+
+		switch subcmd {
+		case "query":
+			if len(args) < 2 {
+				fatal("usage: grafana-cli gcm query <datasource> <promql> --project <project> [--start <t>] [--end <t>] [--step <s>] [--format tsv]")
+			}
+			dsName := args[0]
+			query := args[1]
+			args = args[2:]
+			project, args := getFlag(args, "--project")
+			start, args := getFlag(args, "--start")
+			end, args := getFlag(args, "--end")
+			step, args := getFlag(args, "--step")
+			format, _ := getFlag(args, "--format")
+			if project == "" {
+				fatal("--project is required (use 'gcm projects <datasource>' to list available projects)")
+			}
+			ds, err := gc.FindDatasource(dsName, "stackdriver")
+			if err != nil {
+				fatal("%v", err)
+			}
+			result, err := gc.GCMQuery(ds.UID, project, query, parseTimeMS(start), parseTimeMS(end), step, format)
+			if err != nil {
+				fatal("%v", err)
+			}
+			fmt.Print(result)
+
+		case "projects":
+			if len(args) < 1 {
+				fatal("usage: grafana-cli gcm projects <datasource>")
+			}
+			ds, err := gc.FindDatasource(args[0], "stackdriver")
+			if err != nil {
+				fatal("%v", err)
+			}
+			result, err := gc.GCMProjects(ds.UID)
+			if err != nil {
+				fatal("%v", err)
+			}
+			fmt.Print(result)
+
+		default:
+			fatal("unknown gcm subcommand: %s (use query, projects)", subcmd)
 		}
 
 	default:

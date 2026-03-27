@@ -1,6 +1,6 @@
 # grafana-cli
 
-A CLI for querying Grafana datasources (Prometheus, Loki, Tempo) through Grafana's datasource proxy API. Designed for use by AI coding agents (Claude, etc.) to consume monitoring data.
+A CLI for querying Grafana datasources (Prometheus, Loki, Tempo, Google Cloud Monitoring) through Grafana's API. Designed for use by AI coding agents (Claude, etc.) to consume monitoring data.
 
 ## Why This Approach
 
@@ -63,6 +63,11 @@ grafana-cli loki label-values loki app
 # Tempo
 grafana-cli tempo search tempo --query '{ .http.status_code = 500 }' --start 1h
 grafana-cli tempo trace tempo <traceID>
+
+# Google Cloud Monitoring (via PromQL)
+grafana-cli gcm projects "Google Cloud Monitoring"
+grafana-cli gcm query "Google Cloud Monitoring" 'compute_googleapis_com:instance_cpu_utilization' --project my-project --start 1h
+grafana-cli gcm query "Google Cloud Monitoring" 'avg by (zone) (compute_googleapis_com:instance_cpu_utilization)' --project my-project --start 1h --step 5m
 ```
 
 ## Integrating with Claude / AI Agents
@@ -81,12 +86,15 @@ You can query production monitoring data using `grafana-cli`. Environment is pre
 - `grafana-cli loki query <ds> '{app="api"} |= "error"' --start 1h --limit 50` — search logs
 - `grafana-cli tempo search <ds> --query '{ .http.status_code >= 500 }' --start 1h` — find traces
 - `grafana-cli tempo trace <ds> <traceID>` — get full trace
+- `grafana-cli gcm query <ds> '<promql>' --project <p> --start 1h` — GCM metrics via PromQL
+- `grafana-cli gcm projects <ds>` — list GCP projects
 
 ### Investigation workflow
 1. Check metrics: `grafana-cli prom query <ds> '<metric>'`
-2. Estimate log volume: `grafana-cli loki count <ds> '{app="..."}' --start 2h --step 1m`
-3. Find related logs: `grafana-cli loki query <ds> '{app="...",level="error"}' --direction forward`
-4. Get trace details: `grafana-cli tempo trace <ds> <traceID>`
+2. Check GCM metrics: `grafana-cli gcm query <ds> '<promql>' --project <p> --start 1h`
+3. Estimate log volume: `grafana-cli loki count <ds> '{app="..."}' --start 2h --step 1m`
+4. Find related logs: `grafana-cli loki query <ds> '{app="...",level="error"}' --direction forward`
+5. Get trace details: `grafana-cli tempo trace <ds> <traceID>`
 ```
 
 ## Time Formats
@@ -121,3 +129,33 @@ grafana-cli loki count loki '{app="api"} |= "error"' --start 2h --step 1m
 ```
 This uses `count_over_time` and shows lines-per-bucket, so you know whether
 `--limit 50` will cover 1 second or 1 hour of data.
+
+## Google Cloud Monitoring
+
+GCM metrics are queried using PromQL through Grafana's Cloud Monitoring datasource plugin. All requests go through Grafana's `/api/ds/query` endpoint — no direct GCP API access is needed.
+
+### Discover projects
+```bash
+grafana-cli gcm projects "Google Cloud Monitoring"
+```
+
+### Query metrics
+```bash
+# CPU utilization across all instances
+grafana-cli gcm query "Google Cloud Monitoring" \
+  'compute_googleapis_com:instance_cpu_utilization' \
+  --project my-project --start 1h
+
+# Average by zone
+grafana-cli gcm query "Google Cloud Monitoring" \
+  'avg by (zone) (compute_googleapis_com:instance_cpu_utilization)' \
+  --project my-project --start 1h --step 5m
+```
+
+### GCM metric naming in PromQL
+
+GCM metrics use `service_com:metric_name` format:
+- `compute_googleapis_com:instance_cpu_utilization` — GCE CPU
+- `cloudsql_googleapis_com:database_cpu_utilization` — Cloud SQL CPU
+- `run_googleapis_com:request_count` — Cloud Run requests
+- `loadbalancing_googleapis_com:https_request_count` — Load balancer requests

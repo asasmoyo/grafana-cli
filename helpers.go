@@ -144,6 +144,26 @@ func parseTimeNano(val string) string {
 	return val
 }
 
+// parseTimeMS converts a time flag to a millisecond epoch string.
+// Handles relative times (1h, 30m, 2d) and unix second timestamps.
+func parseTimeMS(val string) string {
+	if val == "" {
+		return ""
+	}
+	// Try relative time (e.g., "1h", "30m", "2d") → seconds → ms
+	rel := parseRelativeTime(val, false)
+	if rel != val {
+		if ts, err := strconv.ParseInt(rel, 10, 64); err == nil {
+			return fmt.Sprintf("%d", ts*1000)
+		}
+	}
+	// Auto-detect seconds-epoch timestamps (10-12 digits) and convert to ms.
+	if ts, err := strconv.ParseInt(val, 10, 64); err == nil && len(val) <= 12 {
+		return fmt.Sprintf("%d", ts*1000)
+	}
+	return val
+}
+
 // parseDurationSeconds returns the number of seconds represented by a relative
 // duration string (e.g. "30m" → 1800, "2h" → 7200). Returns -1 if the value
 // is not a recognized relative duration.

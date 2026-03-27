@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -152,4 +153,36 @@ func (g *GrafanaClient) FindDatasource(nameOrID string, dsType string) (*Datasou
 
 func (g *GrafanaClient) proxyPath(dsID int, subpath string) string {
 	return fmt.Sprintf("/api/datasources/proxy/%d/%s", dsID, subpath)
+}
+
+func (g *GrafanaClient) post(path string, body []byte) ([]byte, error) {
+	req, err := http.NewRequest("POST", g.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+g.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if int64(len(respBody)) == maxResponseBody {
+		fmt.Fprintf(os.Stderr, "warning: response truncated at %dMB, results may be incomplete\n", maxResponseBody/1024/1024)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 500))
+	}
+	return respBody, nil
+}
+
+func (g *GrafanaClient) resourceGet(dsUID, subpath string) ([]byte, error) {
+	return g.get(fmt.Sprintf("/api/datasources/uid/%s/resources/%s", dsUID, subpath))
 }

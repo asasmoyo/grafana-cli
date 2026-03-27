@@ -654,6 +654,127 @@ func TestIntegrationTempoTrace(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Google Cloud Monitoring
+// ---------------------------------------------------------------------------
+
+func TestIntegrationGCMProjects(t *testing.T) {
+	gc := mustClient(t)
+	ds := mustFindDatasource(t, gc, "Google Cloud Monitoring", "stackdriver")
+
+	result, err := gc.GCMProjects(ds.UID)
+	if err != nil {
+		t.Fatalf("GCMProjects: %v", err)
+	}
+
+	if result == "(no projects found)" {
+		t.Fatal("expected at least one project")
+	}
+	if !strings.Contains(result, "PROJECT_ID") {
+		t.Error("expected PROJECT_ID header")
+	}
+	if !strings.Contains(result, "time-entries-live") {
+		t.Error("expected 'time-entries-live' project")
+	}
+
+	t.Logf("projects:\n%s", truncate(result, 500))
+}
+
+func TestIntegrationGCMQuery(t *testing.T) {
+	gc := mustClient(t)
+	ds := mustFindDatasource(t, gc, "Google Cloud Monitoring", "stackdriver")
+
+	now := time.Now().UTC()
+	start := fmt.Sprintf("%d", now.Add(-1*time.Hour).UnixMilli())
+	end := fmt.Sprintf("%d", now.UnixMilli())
+
+	t.Run("basic_query", func(t *testing.T) {
+		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
+			"avg by (zone) (compute_googleapis_com:instance_cpu_utilization)",
+			start, end, "300s", "")
+		if err != nil {
+			t.Fatalf("GCMQuery: %v", err)
+		}
+		if result == "(no results)" {
+			t.Skip("no GCM data available")
+		}
+		// Matrix output should have series sections
+		if !strings.Contains(result, "──") {
+			t.Error("expected series header (──) in output")
+		}
+		if !strings.Contains(result, "TIME") {
+			t.Error("expected TIME column header")
+		}
+		if !strings.Contains(result, "VALUE") {
+			t.Error("expected VALUE column header")
+		}
+		if !strings.Contains(result, "samples") {
+			t.Error("expected 'samples' count in series header")
+		}
+		t.Logf("result preview: %s", truncate(result, 400))
+	})
+
+	t.Run("tsv_format", func(t *testing.T) {
+		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
+			"avg by (zone) (compute_googleapis_com:instance_cpu_utilization)",
+			start, end, "300s", "tsv")
+		if err != nil {
+			t.Fatalf("GCMQuery tsv: %v", err)
+		}
+		if result == "(no results)" {
+			t.Skip("no GCM data available")
+		}
+		// TSV should have tab-separated lines
+		lines := strings.Split(strings.TrimSpace(result), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "#") {
+				continue
+			}
+			if !strings.Contains(line, "\t") {
+				t.Errorf("expected tab-separated line, got: %s", line)
+				break
+			}
+		}
+	})
+
+	t.Run("bad_query", func(t *testing.T) {
+		_, err := gc.GCMQuery(ds.UID, "time-entries-live",
+			"bad_query{[", start, end, "60s", "")
+		if err == nil {
+			t.Error("expected error for bad query")
+		}
+	})
+
+	t.Run("no_results", func(t *testing.T) {
+		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
+			"nonexistent_metric_xyz_12345_gcm", start, end, "300s", "")
+		if err != nil {
+			// Some nonexistent metrics return errors, some return empty
+			t.Logf("nonexistent metric returned error (expected): %v", err)
+			return
+		}
+		if result != "(no results)" {
+			t.Errorf("expected '(no results)', got: %s", truncate(result, 100))
+		}
+	})
+
+	t.Run("defaults_without_params", func(t *testing.T) {
+		// Empty start/end/step should default to 1h range, 60s step
+		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
+			"count(compute_googleapis_com:instance_cpu_utilization)",
+			"", "", "", "")
+		if err != nil {
+			t.Fatalf("GCMQuery defaults: %v", err)
+		}
+		if result == "(no results)" {
+			t.Skip("no GCM data available")
+		}
+		if !strings.Contains(result, "──") {
+			t.Error("expected series output with defaults")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (unit-testable without Grafana)
 // ---------------------------------------------------------------------------
 
@@ -855,6 +976,175 @@ func TestParseRelativeTime(t *testing.T) {
 		// Single character should pass through (no num+unit to parse)
 		if got := parseRelativeTime("5", false); got != "5" {
 			t.Errorf("expected passthrough for single char, got %q", got)
+		}
+	})
+}
+
+func TestGCMIntervalMS(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int64
+	}{
+		{"", 60000},
+		{"60s", 60000},
+		{"300s", 300000},
+		{"10s", 10000},
+		{"5m", 300000},
+		{"1h", 3600000},
+		{"1d", 86400000},
+		{"bad", 60000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := gcmIntervalMS(tt.input)
+			if got != tt.expected {
+				t.Errorf("gcmIntervalMS(%q) = %d, want %d", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractGCMError(t *testing.T) {
+	t.Run("valid_error", func(t *testing.T) {
+		input := `HTTP 400: {"results":{"A":{"error":"bad metric","status":500,"frames":[]}}}`
+		got := extractGCMError(input)
+		if got != "bad metric" {
+			t.Errorf("expected 'bad metric', got %q", got)
+		}
+	})
+
+	t.Run("no_json", func(t *testing.T) {
+		got := extractGCMError("HTTP 500: Internal Server Error")
+		if got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("no_error_field", func(t *testing.T) {
+		input := `HTTP 200: {"results":{"A":{"status":200,"frames":[]}}}`
+		got := extractGCMError(input)
+		if got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("invalid_json", func(t *testing.T) {
+		got := extractGCMError(`HTTP 400: {"results":{"A":{"error":"truncated...`)
+		if got != "" {
+			t.Errorf("expected empty for truncated JSON, got %q", got)
+		}
+	})
+}
+
+func TestFormatGCMResponseNulls(t *testing.T) {
+	// Simulate a GCM response with null values
+	body := `{
+		"results": {
+			"A": {
+				"status": 200,
+				"frames": [{
+					"schema": {
+						"refId": "A",
+						"meta": {"custom": {"resultType": "matrix"}},
+						"fields": [
+							{"name": "Time", "type": "time"},
+							{"name": "Value", "type": "number", "labels": {"zone": "us-central1-a"}}
+						]
+					},
+					"data": {
+						"values": [
+							[1000, 2000, 3000, 4000],
+							[1.5, null, 2.5, null]
+						]
+					}
+				}]
+			}
+		}
+	}`
+
+	t.Run("table_skips_nulls", func(t *testing.T) {
+		result, err := formatGCMResponse([]byte(body), "")
+		if err != nil {
+			t.Fatalf("formatGCMResponse: %v", err)
+		}
+		// Should show 2 samples (not 4)
+		if !strings.Contains(result, "2 samples") {
+			t.Errorf("expected '2 samples' (nulls excluded), got: %s", result)
+		}
+		// Should contain the non-null values
+		if !strings.Contains(result, "1.5") || !strings.Contains(result, "2.5") {
+			t.Errorf("expected non-null values in output: %s", result)
+		}
+	})
+
+	t.Run("tsv_skips_nulls", func(t *testing.T) {
+		result, err := formatGCMResponse([]byte(body), "tsv")
+		if err != nil {
+			t.Fatalf("formatGCMResponse tsv: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(result), "\n")
+		// Should only have 2 data lines (nulls skipped)
+		if len(lines) != 2 {
+			t.Errorf("expected 2 TSV lines, got %d: %v", len(lines), lines)
+		}
+	})
+
+	t.Run("empty_frames", func(t *testing.T) {
+		emptyBody := `{"results": {"A": {"status": 200, "frames": []}}}`
+		result, err := formatGCMResponse([]byte(emptyBody), "")
+		if err != nil {
+			t.Fatalf("formatGCMResponse empty: %v", err)
+		}
+		if result != "(no results)" {
+			t.Errorf("expected '(no results)', got: %s", result)
+		}
+	})
+
+	t.Run("error_in_result", func(t *testing.T) {
+		errorBody := `{"results": {"A": {"status": 500, "error": "bad query", "frames": []}}}`
+		_, err := formatGCMResponse([]byte(errorBody), "")
+		if err == nil {
+			t.Error("expected error for error result")
+		}
+		if !strings.Contains(err.Error(), "bad query") {
+			t.Errorf("expected 'bad query' in error, got: %v", err)
+		}
+	})
+}
+
+func TestParseTimeMS(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		if got := parseTimeMS(""); got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("relative_to_ms", func(t *testing.T) {
+		result := parseTimeMS("1h")
+		ts, err := strconv.ParseInt(result, 10, 64)
+		if err != nil {
+			t.Fatalf("expected millisecond timestamp, got %q", result)
+		}
+		expected := time.Now().UTC().Add(-1 * time.Hour).UnixMilli()
+		diff := ts - expected
+		if diff < -2000 || diff > 2000 {
+			t.Errorf("millisecond timestamp off by %dms", diff)
+		}
+	})
+
+	t.Run("seconds_epoch_converted_to_ms", func(t *testing.T) {
+		result := parseTimeMS("1774452000")
+		if result != "1774452000000" {
+			t.Errorf("expected seconds→ms conversion, got %q", result)
+		}
+	})
+
+	t.Run("passthrough_ms_timestamp", func(t *testing.T) {
+		// 13-digit ms timestamp should pass through
+		input := "1774452000000"
+		result := parseTimeMS(input)
+		if result != input {
+			t.Errorf("expected passthrough for ms timestamp, got %q", result)
 		}
 	})
 }
@@ -1105,6 +1395,35 @@ func TestIntegrationCLIEndToEnd(t *testing.T) {
 		}
 		if !strings.Contains(out, "TRACE_ID") && !strings.Contains(out, "no traces") {
 			t.Error("expected TRACE_ID header or 'no traces' message")
+		}
+	})
+
+	t.Run("gcm_projects", func(t *testing.T) {
+		out, err := run("gcm", "projects", "Google Cloud Monitoring")
+		if err != nil {
+			t.Fatalf("gcm projects: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "PROJECT_ID") {
+			t.Error("expected PROJECT_ID header")
+		}
+	})
+
+	t.Run("gcm_query", func(t *testing.T) {
+		out, err := run("gcm", "query", "Google Cloud Monitoring",
+			"count(compute_googleapis_com:instance_cpu_utilization)",
+			"--project", "time-entries-live", "--start", "1h", "--step", "300s")
+		if err != nil {
+			t.Fatalf("gcm query: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "──") && !strings.Contains(out, "no results") {
+			t.Error("expected series output or 'no results'")
+		}
+	})
+
+	t.Run("gcm_query_missing_project", func(t *testing.T) {
+		_, err := run("gcm", "query", "Google Cloud Monitoring", "up")
+		if err == nil {
+			t.Error("expected error when --project is missing")
 		}
 	})
 

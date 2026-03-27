@@ -1,11 +1,11 @@
 ---
 name: grafana
-description: Query Grafana observability stack (Prometheus metrics, Loki logs, Tempo traces) via grafana-cli. Use when investigating production issues, checking service health, querying metrics/logs/traces, debugging errors, or answering questions about infrastructure and application behavior.
+description: Query Grafana observability stack (Prometheus metrics, Loki logs, Tempo traces, Google Cloud Monitoring) via grafana-cli. Use when investigating production issues, checking service health, querying metrics/logs/traces, debugging errors, or answering questions about infrastructure and application behavior.
 ---
 
 # Grafana Observability Skill
 
-Query Prometheus metrics, Loki logs, and Tempo traces from your Grafana instance using `grafana-cli`.
+Query Prometheus metrics, Loki logs, Tempo traces, and Google Cloud Monitoring metrics from your Grafana instance using `grafana-cli`.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ Before querying, list available datasources to find the correct names:
 grafana-cli datasources
 ```
 
-Use the datasource **name** (or a partial match) in all commands below. Common names: `Prometheus`, `Loki`, `Tempo`.
+Use the datasource **name** (or a partial match) in all commands below. Common names: `Prometheus`, `Loki`, `Tempo`, `Google Cloud Monitoring`.
 
 ## Commands
 
@@ -94,6 +94,23 @@ grafana-cli tempo search <datasource> --query '<traceql>' --start <time> --limit
 grafana-cli tempo trace <datasource> <traceID>
 ```
 
+### Google Cloud Monitoring
+
+**List projects:**
+```bash
+grafana-cli gcm projects <datasource>
+```
+
+**PromQL query:**
+```bash
+grafana-cli gcm query <datasource> '<promql>' --project <project> --start <time> --step <step>
+```
+
+GCM metrics use `service_com:metric_name` format in PromQL:
+- `compute_googleapis_com:instance_cpu_utilization` — GCE CPU
+- `cloudsql_googleapis_com:database_cpu_utilization` — Cloud SQL CPU
+- `run_googleapis_com:request_count` — Cloud Run requests
+
 ## Time Parameters
 
 - Relative: `30m`, `1h`, `2h`, `6h`, `1d`, `7d`
@@ -108,9 +125,10 @@ When investigating a production issue, follow this order:
 2. **Check service health** — `grafana-cli prom query <ds> 'up{namespace="<ns>"}'`
 3. **Check error rates** — `grafana-cli prom query <ds> 'sum(rate(http_requests_total{code=~"5.."}[5m])) by (service)'`
 4. **Look at recent errors in logs** — `grafana-cli loki query <ds> '{namespace="<ns>"} |= "error"' --start 1h --limit 20`
-5. **Check resource usage** — `grafana-cli prom query-range <ds> 'sum(rate(container_cpu_usage_seconds_total{namespace="<ns>"}[5m])) by (pod)' --start 1h --step 5m`
-6. **Find slow traces** — `grafana-cli tempo search <ds> --query '{ duration > 1s }' --start 1h --limit 10`
-7. **Drill into a trace** — `grafana-cli tempo trace <ds> <traceID>`
+5. **Check GCM metrics** — `grafana-cli gcm query <ds> 'compute_googleapis_com:instance_cpu_utilization' --project <project> --start 1h`
+6. **Check resource usage** — `grafana-cli prom query-range <ds> 'sum(rate(container_cpu_usage_seconds_total{namespace="<ns>"}[5m])) by (pod)' --start 1h --step 5m`
+7. **Find slow traces** — `grafana-cli tempo search <ds> --query '{ duration > 1s }' --start 1h --limit 10`
+8. **Drill into a trace** — `grafana-cli tempo trace <ds> <traceID>`
 
 ## IAP-Protected Grafana
 
