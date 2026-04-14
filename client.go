@@ -35,9 +35,6 @@ func NewGrafanaClient() (*GrafanaClient, error) {
 	if baseURL == "" {
 		return nil, fmt.Errorf("GRAFANA_URL environment variable is required (e.g. https://grafana.example.com)")
 	}
-	if token == "" {
-		return nil, fmt.Errorf("GRAFANA_TOKEN environment variable is required (Service Account token)")
-	}
 
 	// Optional IAP authentication
 	iapClientID := os.Getenv("GRAFANA_IAP_CLIENT_ID")
@@ -47,6 +44,10 @@ func NewGrafanaClient() (*GrafanaClient, error) {
 		return nil, fmt.Errorf("both GRAFANA_IAP_CLIENT_ID and GRAFANA_IAP_SA must be set (got only GRAFANA_IAP_CLIENT_ID)")
 	case iapClientID == "" && iapSA != "":
 		return nil, fmt.Errorf("both GRAFANA_IAP_CLIENT_ID and GRAFANA_IAP_SA must be set (got only GRAFANA_IAP_SA)")
+	}
+
+	if token == "" {
+		return nil, fmt.Errorf("GRAFANA_TOKEN environment variable is required (Service Account token)")
 	}
 
 	httpClient := &http.Client{Timeout: requestTimeout}
@@ -87,9 +88,20 @@ func (g *GrafanaClient) get(path string) ([]byte, error) {
 		fmt.Fprintf(os.Stderr, "warning: response truncated at %dMB, results may be incomplete\n", maxResponseBody/1024/1024)
 	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 500))
+		return nil, httpError(resp, body)
 	}
 	return body, nil
+}
+
+func httpError(resp *http.Response, body []byte) error {
+	msg := truncate(string(body), 500)
+	if resp.Header.Get("X-Goog-Iap-Generated-Response") == "true" {
+		return fmt.Errorf("IAP authentication failed (HTTP %d): %s\n  Check GRAFANA_IAP_CLIENT_ID and GRAFANA_IAP_SA, and verify the service account has roles/iap.httpsResourceAccessor", resp.StatusCode, msg)
+	}
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return fmt.Errorf("Grafana auth failed (HTTP %d): %s\n  Check GRAFANA_TOKEN is valid for %s", resp.StatusCode, msg, resp.Request.URL.Host)
+	}
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, msg)
 }
 
 // --- Datasource discovery ---
@@ -178,7 +190,7 @@ func (g *GrafanaClient) post(path string, body []byte) ([]byte, error) {
 		fmt.Fprintf(os.Stderr, "warning: response truncated at %dMB, results may be incomplete\n", maxResponseBody/1024/1024)
 	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 500))
+		return nil, httpError(resp, respBody)
 	}
 	return respBody, nil
 }

@@ -21,6 +21,29 @@ func (t *iapTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
+// looksLikeJWT checks whether s has the three-part base64url structure of a JWT.
+func looksLikeJWT(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) == 0 {
+			return false
+		}
+		for _, c := range p {
+			if !isBase64URL(c) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isBase64URL(c rune) bool {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '='
+}
+
 // getIAPToken uses gcloud to mint an ID token for the given IAP client ID,
 // impersonating the specified service account.
 func getIAPToken(ctx context.Context, clientID, serviceAccount string) (string, error) {
@@ -36,5 +59,16 @@ func getIAPToken(ctx context.Context, clientID, serviceAccount string) (string, 
 		}
 		return "", fmt.Errorf("gcloud auth print-identity-token failed: %w", err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	token := strings.TrimSpace(string(out))
+	if token == "" {
+		return "", fmt.Errorf("gcloud auth print-identity-token returned empty output")
+	}
+	if !looksLikeJWT(token) {
+		preview := token
+		if len(preview) > 40 {
+			preview = preview[:40] + "..."
+		}
+		return "", fmt.Errorf("gcloud auth print-identity-token returned non-JWT output: %q", preview)
+	}
+	return token, nil
 }
