@@ -12,7 +12,7 @@ import (
 
 // --- Loki queries ---
 
-func (g *GrafanaClient) LokiQuery(dsID int, query, start, end string, limit int, direction, format string) (string, error) {
+func (g *GrafanaClient) LokiQuery(dsUID string, query, start, end string, limit int, direction, format string) (string, error) {
 	now := time.Now().UTC()
 	if end == "" {
 		end = fmt.Sprintf("%d", now.UnixNano())
@@ -34,7 +34,7 @@ func (g *GrafanaClient) LokiQuery(dsID int, query, start, end string, limit int,
 		"limit":     {strconv.Itoa(limit)},
 		"direction": {direction},
 	}
-	path := g.proxyPath(dsID, "loki/api/v1/query_range?"+params.Encode())
+	path := g.proxyPath(dsUID, "loki/api/v1/query_range?"+params.Encode())
 	body, err := g.get(path)
 	if err != nil {
 		return "", err
@@ -42,7 +42,7 @@ func (g *GrafanaClient) LokiQuery(dsID int, query, start, end string, limit int,
 	return formatLokiResponse(body, format)
 }
 
-func (g *GrafanaClient) LokiCount(dsID int, query, start, end, step, format string) (string, error) {
+func (g *GrafanaClient) LokiCount(dsUID string, query, start, end, step, format string) (string, error) {
 	now := time.Now().UTC()
 	if end == "" {
 		end = fmt.Sprintf("%d", now.UnixNano())
@@ -62,7 +62,7 @@ func (g *GrafanaClient) LokiCount(dsID int, query, start, end, step, format stri
 		"end":   {end},
 		"step":  {step},
 	}
-	path := g.proxyPath(dsID, "loki/api/v1/query_range?"+params.Encode())
+	path := g.proxyPath(dsUID, "loki/api/v1/query_range?"+params.Encode())
 	body, err := g.get(path)
 	if err != nil {
 		return "", err
@@ -70,8 +70,8 @@ func (g *GrafanaClient) LokiCount(dsID int, query, start, end, step, format stri
 	return formatLokiCountResponse(body, format)
 }
 
-func (g *GrafanaClient) LokiLabels(dsID int) (string, error) {
-	body, err := g.get(g.proxyPath(dsID, "loki/api/v1/labels"))
+func (g *GrafanaClient) LokiLabels(dsUID string) (string, error) {
+	body, err := g.get(g.proxyPath(dsUID, "loki/api/v1/labels"))
 	if err != nil {
 		return "", err
 	}
@@ -84,8 +84,8 @@ func (g *GrafanaClient) LokiLabels(dsID int) (string, error) {
 	return strings.Join(resp.Data, "\n"), nil
 }
 
-func (g *GrafanaClient) LokiLabelValues(dsID int, label string) (string, error) {
-	body, err := g.get(g.proxyPath(dsID, "loki/api/v1/label/"+url.PathEscape(label)+"/values"))
+func (g *GrafanaClient) LokiLabelValues(dsUID string, label string) (string, error) {
+	body, err := g.get(g.proxyPath(dsUID, "loki/api/v1/label/"+url.PathEscape(label)+"/values"))
 	if err != nil {
 		return "", err
 	}

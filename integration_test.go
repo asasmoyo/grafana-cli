@@ -180,7 +180,7 @@ func TestIntegrationPromQueryInstant(t *testing.T) {
 	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
 
 	t.Run("simple_query", func(t *testing.T) {
-		result, err := gc.PromQueryInstant(ds.ID, "count(up)", "", "")
+		result, err := gc.PromQueryInstant(ds.UID, "count(up)", "", "")
 		if err != nil {
 			t.Fatalf("PromQueryInstant: %v", err)
 		}
@@ -200,7 +200,7 @@ func TestIntegrationPromQueryInstant(t *testing.T) {
 
 	t.Run("with_timestamp", func(t *testing.T) {
 		ts := fmt.Sprintf("%d", time.Now().Add(-30*time.Minute).Unix())
-		result, err := gc.PromQueryInstant(ds.ID, "count(up)", ts, "")
+		result, err := gc.PromQueryInstant(ds.UID, "count(up)", ts, "")
 		if err != nil {
 			t.Fatalf("PromQueryInstant with timestamp: %v", err)
 		}
@@ -210,7 +210,7 @@ func TestIntegrationPromQueryInstant(t *testing.T) {
 	})
 
 	t.Run("label_filtering", func(t *testing.T) {
-		result, err := gc.PromQueryInstant(ds.ID, "up{job=\"kubernetes-nodes\"}", "", "")
+		result, err := gc.PromQueryInstant(ds.UID, "up{job=\"kubernetes-nodes\"}", "", "")
 		if err != nil {
 			t.Fatalf("PromQueryInstant: %v", err)
 		}
@@ -232,7 +232,7 @@ func TestIntegrationPromQueryInstant(t *testing.T) {
 	})
 
 	t.Run("no_results", func(t *testing.T) {
-		result, err := gc.PromQueryInstant(ds.ID, "nonexistent_metric_xyz_12345", "", "")
+		result, err := gc.PromQueryInstant(ds.UID, "nonexistent_metric_xyz_12345", "", "")
 		if err != nil {
 			t.Fatalf("PromQueryInstant: %v", err)
 		}
@@ -251,7 +251,7 @@ func TestIntegrationPromQueryRange(t *testing.T) {
 	end := fmt.Sprintf("%d", now.Unix())
 
 	t.Run("basic_range", func(t *testing.T) {
-		result, err := gc.PromQueryRange(ds.ID,
+		result, err := gc.PromQueryRange(ds.UID,
 			`sum(rate(container_cpu_usage_seconds_total{namespace="default"}[5m])) by (pod)`,
 			start, end, "5m", "")
 		if err != nil {
@@ -278,7 +278,7 @@ func TestIntegrationPromQueryRange(t *testing.T) {
 
 	t.Run("defaults_without_params", func(t *testing.T) {
 		// Empty start/end/step should default to 1h range, 60s step
-		result, err := gc.PromQueryRange(ds.ID, "count(up)", "", "", "", "")
+		result, err := gc.PromQueryRange(ds.UID, "count(up)", "", "", "", "")
 		if err != nil {
 			t.Fatalf("PromQueryRange defaults: %v", err)
 		}
@@ -292,7 +292,7 @@ func TestIntegrationPromLabels(t *testing.T) {
 	gc := mustClient(t)
 	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
 
-	result, err := gc.PromLabels(ds.ID)
+	result, err := gc.PromLabels(ds.UID)
 	if err != nil {
 		t.Fatalf("PromLabels: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestIntegrationPromLabelValues(t *testing.T) {
 	gc := mustClient(t)
 	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
 
-	result, err := gc.PromLabelValues(ds.ID, "namespace")
+	result, err := gc.PromLabelValues(ds.UID, "namespace")
 	if err != nil {
 		t.Fatalf("PromLabelValues: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestIntegrationPromSeries(t *testing.T) {
 	gc := mustClient(t)
 	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
 
-	result, err := gc.PromSeries(ds.ID, `{__name__="up",job="kubernetes-nodes"}`)
+	result, err := gc.PromSeries(ds.UID, `{__name__="up",job="kubernetes-nodes"}`)
 	if err != nil {
 		t.Fatalf("PromSeries: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestIntegrationLokiQuery(t *testing.T) {
 	end := fmt.Sprintf("%d", now.UnixNano())
 
 	t.Run("basic_query", func(t *testing.T) {
-		result, err := gc.LokiQuery(ds.ID, `{namespace="default"}`, start, end, 5, "", "")
+		result, err := gc.LokiQuery(ds.UID, `{namespace="default"}`, start, end, 5, "", "")
 		if err != nil {
 			t.Fatalf("LokiQuery: %v", err)
 		}
@@ -422,7 +422,7 @@ func TestIntegrationLokiQuery(t *testing.T) {
 	})
 
 	t.Run("with_filter", func(t *testing.T) {
-		result, err := gc.LokiQuery(ds.ID, `{namespace="default"} |= "error"`, start, end, 3, "", "")
+		result, err := gc.LokiQuery(ds.UID, `{namespace="default"} |= "error"`, start, end, 3, "", "")
 		if err != nil {
 			t.Fatalf("LokiQuery with filter: %v", err)
 		}
@@ -444,7 +444,7 @@ func TestIntegrationLokiQuery(t *testing.T) {
 
 	t.Run("defaults_without_params", func(t *testing.T) {
 		// Empty start/end should default to last 1h
-		result, err := gc.LokiQuery(ds.ID, `{namespace="default"}`, "", "", 3, "", "")
+		result, err := gc.LokiQuery(ds.UID, `{namespace="default"}`, "", "", 3, "", "")
 		if err != nil {
 			t.Fatalf("LokiQuery defaults: %v", err)
 		}
@@ -455,7 +455,7 @@ func TestIntegrationLokiQuery(t *testing.T) {
 	})
 
 	t.Run("limit_respected", func(t *testing.T) {
-		result, err := gc.LokiQuery(ds.ID, `{namespace="default"}`, start, end, 2, "", "")
+		result, err := gc.LokiQuery(ds.UID, `{namespace="default"}`, start, end, 2, "", "")
 		if err != nil {
 			t.Fatalf("LokiQuery: %v", err)
 		}
@@ -479,7 +479,7 @@ func TestIntegrationLokiLabels(t *testing.T) {
 	gc := mustClient(t)
 	ds := mustFindDatasource(t, gc, "Loki", "loki")
 
-	result, err := gc.LokiLabels(ds.ID)
+	result, err := gc.LokiLabels(ds.UID)
 	if err != nil {
 		t.Fatalf("LokiLabels: %v", err)
 	}
@@ -506,7 +506,7 @@ func TestIntegrationLokiLabelValues(t *testing.T) {
 	gc := mustClient(t)
 	ds := mustFindDatasource(t, gc, "Loki", "loki")
 
-	result, err := gc.LokiLabelValues(ds.ID, "namespace")
+	result, err := gc.LokiLabelValues(ds.UID, "namespace")
 	if err != nil {
 		t.Fatalf("LokiLabelValues: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestIntegrationTempoSearch(t *testing.T) {
 	end := fmt.Sprintf("%d", now.Unix())
 
 	t.Run("basic_search", func(t *testing.T) {
-		result, err := gc.TempoSearch(ds.ID, "", start, end, 5)
+		result, err := gc.TempoSearch(ds.UID, "", start, end, 5)
 		if err != nil {
 			t.Fatalf("TempoSearch: %v", err)
 		}
@@ -568,7 +568,7 @@ func TestIntegrationTempoSearch(t *testing.T) {
 	})
 
 	t.Run("with_query", func(t *testing.T) {
-		result, err := gc.TempoSearch(ds.ID, "{}", start, end, 3)
+		result, err := gc.TempoSearch(ds.UID, "{}", start, end, 3)
 		if err != nil {
 			t.Fatalf("TempoSearch with query: %v", err)
 		}
@@ -579,7 +579,7 @@ func TestIntegrationTempoSearch(t *testing.T) {
 	})
 
 	t.Run("defaults_without_params", func(t *testing.T) {
-		result, err := gc.TempoSearch(ds.ID, "", "", "", 3)
+		result, err := gc.TempoSearch(ds.UID, "", "", "", 3)
 		if err != nil {
 			t.Fatalf("TempoSearch defaults: %v", err)
 		}
@@ -598,7 +598,7 @@ func TestIntegrationTempoTrace(t *testing.T) {
 	start := fmt.Sprintf("%d", now.Add(-1*time.Hour).Unix())
 	end := fmt.Sprintf("%d", now.Unix())
 
-	searchResult, err := gc.TempoSearch(ds.ID, "", start, end, 5)
+	searchResult, err := gc.TempoSearch(ds.UID, "", start, end, 5)
 	if err != nil {
 		t.Fatalf("TempoSearch for trace IDs: %v", err)
 	}
@@ -617,7 +617,7 @@ func TestIntegrationTempoTrace(t *testing.T) {
 	}
 
 	t.Run("fetch_trace", func(t *testing.T) {
-		result, err := gc.TempoTrace(ds.ID, traceID)
+		result, err := gc.TempoTrace(ds.UID, traceID)
 		if err != nil {
 			t.Fatalf("TempoTrace(%s): %v", traceID, err)
 		}
@@ -645,7 +645,7 @@ func TestIntegrationTempoTrace(t *testing.T) {
 
 	t.Run("nonexistent_trace", func(t *testing.T) {
 		// Tempo returns 404 or empty for nonexistent traces
-		_, err := gc.TempoTrace(ds.ID, "00000000000000000000000000000000")
+		_, err := gc.TempoTrace(ds.UID, "00000000000000000000000000000000")
 		// Either an error or empty result is acceptable
 		if err != nil {
 			t.Logf("nonexistent trace returned error (expected): %v", err)

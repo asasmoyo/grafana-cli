@@ -242,7 +242,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.PromQueryInstant(ds.ID, query, parseTimeFlag(ts), format)
+			result, err := gc.PromQueryInstant(ds.UID, query, parseTimeFlag(ts), format)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -269,7 +269,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.PromQueryRange(ds.ID, query, parseTimeFlag(start), parseTimeFlag(end), step, format)
+			result, err := gc.PromQueryRange(ds.UID, query, parseTimeFlag(start), parseTimeFlag(end), step, format)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -283,7 +283,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.PromLabels(ds.ID)
+			result, err := gc.PromLabels(ds.UID)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -297,7 +297,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.PromLabelValues(ds.ID, args[1])
+			result, err := gc.PromLabelValues(ds.UID, args[1])
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -311,7 +311,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.PromSeries(ds.ID, args[1])
+			result, err := gc.PromSeries(ds.UID, args[1])
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -349,7 +349,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.LokiQuery(ds.ID, query, parseTimeNano(start), parseTimeNano(end), limit, direction, format)
+			result, err := gc.LokiQuery(ds.UID, query, parseTimeNano(start), parseTimeNano(end), limit, direction, format)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -370,7 +370,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.LokiCount(ds.ID, query, parseTimeNano(start), parseTimeNano(end), step, format)
+			result, err := gc.LokiCount(ds.UID, query, parseTimeNano(start), parseTimeNano(end), step, format)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -384,7 +384,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.LokiLabels(ds.ID)
+			result, err := gc.LokiLabels(ds.UID)
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -398,7 +398,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.LokiLabelValues(ds.ID, args[1])
+			result, err := gc.LokiLabelValues(ds.UID, args[1])
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -424,7 +424,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.TempoTrace(ds.ID, args[1])
+			result, err := gc.TempoTrace(ds.UID, args[1])
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -448,7 +448,7 @@ func main() {
 			if err != nil {
 				fatal("%v", err)
 			}
-			result, err := gc.TempoSearch(ds.ID, query, parseTimeFlag(start), parseTimeFlag(end), limit)
+			result, err := gc.TempoSearch(ds.UID, query, parseTimeFlag(start), parseTimeFlag(end), limit)
 			if err != nil {
 				fatal("%v", err)
 			}

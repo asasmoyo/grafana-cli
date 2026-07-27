@@ -163,8 +163,8 @@ func (g *GrafanaClient) FindDatasource(nameOrID string, dsType string) (*Datasou
 	return nil, fmt.Errorf("datasource %q not found (use 'datasources' to list available ones)", nameOrID)
 }
 
-func (g *GrafanaClient) proxyPath(dsID int, subpath string) string {
-	return fmt.Sprintf("/api/datasources/proxy/%d/%s", dsID, subpath)
+func (g *GrafanaClient) proxyPath(dsUID string, subpath string) string {
+	return fmt.Sprintf("/api/datasources/proxy/uid/%s/%s", dsUID, subpath)
 }
 
 func (g *GrafanaClient) post(path string, body []byte) ([]byte, error) {

@@ -12,15 +12,15 @@ import (
 
 // --- Tempo queries ---
 
-func (g *GrafanaClient) TempoTrace(dsID int, traceID string) (string, error) {
-	body, err := g.get(g.proxyPath(dsID, "api/traces/"+url.PathEscape(traceID)))
+func (g *GrafanaClient) TempoTrace(dsUID string, traceID string) (string, error) {
+	body, err := g.get(g.proxyPath(dsUID, "api/traces/"+url.PathEscape(traceID)))
 	if err != nil {
 		return "", err
 	}
 	return formatTempoTrace(body)
 }
 
-func (g *GrafanaClient) TempoSearch(dsID int, query, start, end string, limit int) (string, error) {
+func (g *GrafanaClient) TempoSearch(dsUID string, query, start, end string, limit int) (string, error) {
 	now := time.Now().UTC()
 	if end == "" {
 		end = fmt.Sprintf("%d", now.Unix())
@@ -40,7 +40,7 @@ func (g *GrafanaClient) TempoSearch(dsID int, query, start, end string, limit in
 	} else {
 		params.Set("limit", strconv.Itoa(defaultLimit))
 	}
-	path := g.proxyPath(dsID, "api/search?"+params.Encode())
+	path := g.proxyPath(dsUID, "api/search?"+params.Encode())
 	body, err := g.get(path)
 	if err != nil {
 		return "", err

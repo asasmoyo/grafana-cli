@@ -11,7 +11,7 @@ import (
 
 // --- Prometheus queries ---
 
-func (g *GrafanaClient) PromQueryRange(dsID int, query, start, end, step, format string) (string, error) {
+func (g *GrafanaClient) PromQueryRange(dsUID string, query, start, end, step, format string) (string, error) {
 	now := time.Now().UTC()
 	if end == "" {
 		end = fmt.Sprintf("%d", now.Unix())
@@ -29,7 +29,7 @@ func (g *GrafanaClient) PromQueryRange(dsID int, query, start, end, step, format
 		"end":   {end},
 		"step":  {step},
 	}
-	path := g.proxyPath(dsID, "api/v1/query_range?"+params.Encode())
+	path := g.proxyPath(dsUID, "api/v1/query_range?"+params.Encode())
 	body, err := g.get(path)
 	if err != nil {
 		return "", err
@@ -37,12 +37,12 @@ func (g *GrafanaClient) PromQueryRange(dsID int, query, start, end, step, format
 	return formatPromResponse(body, format)
 }
 
-func (g *GrafanaClient) PromQueryInstant(dsID int, query, ts, format string) (string, error) {
+func (g *GrafanaClient) PromQueryInstant(dsUID string, query, ts, format string) (string, error) {
 	params := url.Values{"query": {query}}
 	if ts != "" {
 		params.Set("time", ts)
 	}
-	path := g.proxyPath(dsID, "api/v1/query?"+params.Encode())
+	path := g.proxyPath(dsUID, "api/v1/query?"+params.Encode())
 	body, err := g.get(path)
 	if err != nil {
 		return "", err
@@ -50,8 +50,8 @@ func (g *GrafanaClient) PromQueryInstant(dsID int, query, ts, format string) (st
 	return formatPromResponse(body, format)
 }
 
-func (g *GrafanaClient) PromLabels(dsID int) (string, error) {
-	body, err := g.get(g.proxyPath(dsID, "api/v1/labels"))
+func (g *GrafanaClient) PromLabels(dsUID string) (string, error) {
+	body, err := g.get(g.proxyPath(dsUID, "api/v1/labels"))
 	if err != nil {
 		return "", err
 	}
@@ -64,8 +64,8 @@ func (g *GrafanaClient) PromLabels(dsID int) (string, error) {
 	return strings.Join(resp.Data, "\n"), nil
 }
 
-func (g *GrafanaClient) PromLabelValues(dsID int, label string) (string, error) {
-	body, err := g.get(g.proxyPath(dsID, "api/v1/label/"+url.PathEscape(label)+"/values"))
+func (g *GrafanaClient) PromLabelValues(dsUID string, label string) (string, error) {
+	body, err := g.get(g.proxyPath(dsUID, "api/v1/label/"+url.PathEscape(label)+"/values"))
 	if err != nil {
 		return "", err
 	}
@@ -78,9 +78,9 @@ func (g *GrafanaClient) PromLabelValues(dsID int, label string) (string, error) 
 	return strings.Join(resp.Data, "\n"), nil
 }
 
-func (g *GrafanaClient) PromSeries(dsID int, match string) (string, error) {
+func (g *GrafanaClient) PromSeries(dsUID string, match string) (string, error) {
 	params := url.Values{"match[]": {match}}
-	body, err := g.get(g.proxyPath(dsID, "api/v1/series?"+params.Encode()))
+	body, err := g.get(g.proxyPath(dsUID, "api/v1/series?"+params.Encode()))
 	if err != nil {
 		return "", err
 	}
