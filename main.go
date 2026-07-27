@@ -2,10 +2,10 @@ package main
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 )
@@ -74,6 +74,8 @@ ENVIRONMENT:
   GRAFANA_TOKEN          Service Account token (Bearer token)
   GRAFANA_IAP_CLIENT_ID  Google Cloud IAP OAuth Client ID (optional, for IAP-protected Grafana)
   GRAFANA_IAP_SA         Service account to impersonate for IAP auth (optional, requires gcloud CLI)
+  GRAFANA_HIDE_LABEL_PREFIXES  Comma-separated label prefixes to hide from compact
+                         output (default: Kubernetes/GKE noise; set empty to hide nothing)
 
 COMMANDS:
   install-skill [path]                     Install agent skill file (default: ~/.claude/skills/grafana/SKILL.md)
@@ -136,14 +138,25 @@ EXAMPLES:
   grafana-cli gcm query "Google Cloud Monitoring" 'compute_googleapis_com:instance_cpu_utilization' --project time-entries-live --start 1h
   grafana-cli gcm query "Google Cloud Monitoring" 'avg by (zone) (compute_googleapis_com:instance_cpu_utilization)' --project time-entries-live --start 1h --step 5m
 
-TIME FORMATS:
-  Relative:     30m, 1h, 2d (lookback from now)
-  Unix seconds: 1774452000 (auto-converted to nanos for Loki, millis for GCM)
+TIME FORMATS (--start, --end, --time):
+  Relative:     90s, 30m, 1h, 1h30m, 2d, 1w (lookback from now)
+  Unix seconds: 1774452000
   Unix nanos:   1774452000000000000
+  RFC3339:      2026-07-27T10:00:00Z, 2026-07-27T12:00:00+02:00
+  All forms work with every command: each is converted to the unit that
+  datasource expects (seconds for Prometheus/Tempo, nanoseconds for Loki,
+  milliseconds for GCM). Anything else is rejected rather than forwarded to
+  the datasource.
 
 DATASOURCE ARGUMENT:
-  Can be a datasource name (or partial match), ID number, or type name.
-  Use 'datasources' command to see what's available.
+  Resolved in this order: uid, numeric id, exact name, exact type, partial
+  name, partial type — all case-insensitive. Pass the UID from the
+  'datasources' command for an unambiguous match; a selector that matches
+  several datasources is an error rather than an arbitrary pick.
+
+FLAGS:
+  Unknown flags, malformed durations and unquoted queries are rejected. Add
+  --help to any subcommand to print its usage.
 
 GCM METRIC NAMING:
   GCM metrics use service_com:metric_name format in PromQL:
@@ -160,24 +173,29 @@ func fatal(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func getFlag(args []string, flag string) (string, []string) {
-	for i, a := range args {
-		if a == flag && i+1 < len(args) {
-			val := args[i+1]
-			rest := make([]string, 0, len(args)-2)
-			rest = append(rest, args[:i]...)
-			rest = append(rest, args[i+2:]...)
-			return val, rest
-		}
-		if strings.HasPrefix(a, flag+"=") {
-			val := strings.TrimPrefix(a, flag+"=")
-			rest := make([]string, 0, len(args)-1)
-			rest = append(rest, args[:i]...)
-			rest = append(rest, args[i+1:]...)
-			return val, rest
-		}
+// mustParse parses one command's arguments, or exits. "-h"/"--help" prints the
+// command usage and exits successfully so that agents can discover a command's
+// shape without triggering an error.
+func mustParse(usage string, args []string, wantPos int, specs ...flagSpec) *parsedArgs {
+	p, err := parseArgs(usage, args, wantPos, specs...)
+	if errors.Is(err, errHelp) {
+		fmt.Println(usage)
+		os.Exit(0)
 	}
-	return "", args
+	if err != nil {
+		fatal("%v", err)
+	}
+	return p
+}
+
+// findDS resolves the datasource argument or exits with a message listing the
+// datasources that would have worked.
+func findDS(gc *GrafanaClient, selector, dsType string) *Datasource {
+	ds, err := gc.FindDatasource(selector, dsType)
+	if err != nil {
+		fatal("%v", err)
+	}
+	return ds
 }
 
 func main() {
@@ -206,18 +224,21 @@ func main() {
 
 	switch cmd {
 	case "datasources", "ds":
+		mustParse("usage: grafana-cli datasources", args, 0)
 		datasources, err := gc.ListDatasources()
 		if err != nil {
 			fatal("listing datasources: %v", err)
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintf(w, "ID\tUID\tNAME\tTYPE\tDEFAULT\n")
+		// UID first: it is the identifier every command should be given, and
+		// the only one Grafana 13 still accepts on the query APIs.
+		fmt.Fprintf(w, "UID\tNAME\tTYPE\tDEFAULT\tID\n")
 		for _, ds := range datasources {
 			def := ""
 			if ds.IsDefault {
 				def = "*"
 			}
-			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", ds.ID, ds.UID, ds.Name, ds.Type, def)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\n", ds.UID, ds.Name, ds.Type, def, ds.ID)
 		}
 		w.Flush()
 
@@ -230,59 +251,41 @@ func main() {
 
 		switch subcmd {
 		case "query":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli prom query <datasource> <promql> [--time <ts>] [--format tsv]")
-			}
-			dsName := args[0]
-			query := args[1]
-			args = args[2:]
-			ts, args := getFlag(args, "--time")
-			format, _ := getFlag(args, "--format")
-			ds, err := gc.FindDatasource(dsName, "prometheus")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.PromQueryInstant(ds.UID, query, parseTimeFlag(ts), format)
+			usage := "usage: grafana-cli prom query <datasource> <promql> [--time <ts>] [--format tsv]"
+			p := mustParse(usage, args, 2,
+				timeFlag("--time", "evaluation time (default: now)"),
+				formatFlag())
+			ds := findDS(gc, p.pos(0), "prometheus")
+			result, err := gc.PromQueryInstant(ds.UID, p.pos(1), parseTimeFlag(p.str("--time")), p.str("--format"))
 			if err != nil {
 				fatal("%v", err)
 			}
 			fmt.Print(result)
 
 		case "query-range", "range":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli prom query-range <datasource> <promql> [--start <t>] [--end <t>] [--step <s>] [--format tsv]")
-			}
-			dsName := args[0]
-			query := args[1]
-			args = args[2:]
-			start, args := getFlag(args, "--start")
-			end, args := getFlag(args, "--end")
-			step, args := getFlag(args, "--step")
-			format, _ := getFlag(args, "--format")
+			usage := "usage: grafana-cli prom query-range <datasource> <promql> [--start <t>] [--end <t>] [--step <s>] [--format tsv]"
+			p := mustParse(usage, args, 2,
+				timeFlag("--start", "window start (default: 1h ago)"),
+				timeFlag("--end", "window end (default: now)"),
+				stepFlag("--step", "resolution (default: "+defaultStep+")"),
+				formatFlag())
+			start := p.str("--start")
 
 			// Warn when the query range exceeds 6 hours — these often timeout.
 			if dur := parseDurationSeconds(start); dur > 6*3600 {
 				fmt.Fprintf(os.Stderr, "warning: --start %s is a %.0fh range — large Prometheus queries often timeout. Consider splitting into sequential queries.\n", start, float64(dur)/3600)
 			}
 
-			ds, err := gc.FindDatasource(dsName, "prometheus")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.PromQueryRange(ds.UID, query, parseTimeFlag(start), parseTimeFlag(end), step, format)
+			ds := findDS(gc, p.pos(0), "prometheus")
+			result, err := gc.PromQueryRange(ds.UID, p.pos(1), parseTimeFlag(start), parseTimeFlag(p.str("--end")), p.str("--step"), p.str("--format"))
 			if err != nil {
 				fatal("%v", err)
 			}
 			fmt.Print(result)
 
 		case "labels":
-			if len(args) < 1 {
-				fatal("usage: grafana-cli prom labels <datasource>")
-			}
-			ds, err := gc.FindDatasource(args[0], "prometheus")
-			if err != nil {
-				fatal("%v", err)
-			}
+			p := mustParse("usage: grafana-cli prom labels <datasource>", args, 1)
+			ds := findDS(gc, p.pos(0), "prometheus")
 			result, err := gc.PromLabels(ds.UID)
 			if err != nil {
 				fatal("%v", err)
@@ -290,28 +293,18 @@ func main() {
 			fmt.Println(result)
 
 		case "label-values":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli prom label-values <datasource> <label>")
-			}
-			ds, err := gc.FindDatasource(args[0], "prometheus")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.PromLabelValues(ds.UID, args[1])
+			p := mustParse("usage: grafana-cli prom label-values <datasource> <label>", args, 2)
+			ds := findDS(gc, p.pos(0), "prometheus")
+			result, err := gc.PromLabelValues(ds.UID, p.pos(1))
 			if err != nil {
 				fatal("%v", err)
 			}
 			fmt.Println(result)
 
 		case "series":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli prom series <datasource> <match>")
-			}
-			ds, err := gc.FindDatasource(args[0], "prometheus")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.PromSeries(ds.UID, args[1])
+			p := mustParse("usage: grafana-cli prom series <datasource> <match>", args, 2)
+			ds := findDS(gc, p.pos(0), "prometheus")
+			result, err := gc.PromSeries(ds.UID, p.pos(1))
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -323,67 +316,46 @@ func main() {
 
 	case "loki":
 		if len(args) == 0 {
-			fatal("usage: grafana-cli loki <query|labels|label-values> <datasource> ...")
+			fatal("usage: grafana-cli loki <query|count|labels|label-values> <datasource> ...")
 		}
 		subcmd := args[0]
 		args = args[1:]
 
 		switch subcmd {
 		case "query":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli loki query <datasource> <logql> [--start <t>] [--end <t>] [--limit <n>] [--direction forward|backward] [--format tsv]")
-			}
-			dsName := args[0]
-			query := args[1]
-			args = args[2:]
-			start, args := getFlag(args, "--start")
-			end, args := getFlag(args, "--end")
-			limitStr, args := getFlag(args, "--limit")
-			direction, args := getFlag(args, "--direction")
-			format, _ := getFlag(args, "--format")
-			limit := defaultLimit
-			if limitStr != "" {
-				limit, _ = strconv.Atoi(limitStr)
-			}
-			ds, err := gc.FindDatasource(dsName, "loki")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.LokiQuery(ds.UID, query, parseTimeNano(start), parseTimeNano(end), limit, direction, format)
+			usage := "usage: grafana-cli loki query <datasource> <logql> [--start <t>] [--end <t>] [--limit <n>] [--direction forward|backward] [--format tsv]"
+			p := mustParse(usage, args, 2,
+				timeFlag("--start", "window start (default: 1h ago)"),
+				timeFlag("--end", "window end (default: now)"),
+				intFlag("--limit", "max log lines (default: 100)"),
+				enumFlag("--direction", "sort order", "forward", "backward"),
+				formatFlag())
+			ds := findDS(gc, p.pos(0), "loki")
+			result, err := gc.LokiQuery(ds.UID, p.pos(1), parseTimeNano(p.str("--start")), parseTimeNano(p.str("--end")),
+				p.intOr("--limit", defaultLimit), p.str("--direction"), p.str("--format"))
 			if err != nil {
 				fatal("%v", err)
 			}
 			fmt.Print(result)
 
 		case "count":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli loki count <datasource> <logql> [--start <t>] [--end <t>] [--step <s>] [--format tsv]")
-			}
-			dsName := args[0]
-			query := args[1]
-			args = args[2:]
-			start, args := getFlag(args, "--start")
-			end, args := getFlag(args, "--end")
-			step, args := getFlag(args, "--step")
-			format, _ := getFlag(args, "--format")
-			ds, err := gc.FindDatasource(dsName, "loki")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.LokiCount(ds.UID, query, parseTimeNano(start), parseTimeNano(end), step, format)
+			usage := "usage: grafana-cli loki count <datasource> <logql> [--start <t>] [--end <t>] [--step <s>] [--format tsv]"
+			p := mustParse(usage, args, 2,
+				timeFlag("--start", "window start (default: 1h ago)"),
+				timeFlag("--end", "window end (default: now)"),
+				stepFlag("--step", "bucket size (default: 1m)"),
+				formatFlag())
+			ds := findDS(gc, p.pos(0), "loki")
+			result, err := gc.LokiCount(ds.UID, p.pos(1), parseTimeNano(p.str("--start")), parseTimeNano(p.str("--end")),
+				p.str("--step"), p.str("--format"))
 			if err != nil {
 				fatal("%v", err)
 			}
 			fmt.Print(result)
 
 		case "labels":
-			if len(args) < 1 {
-				fatal("usage: grafana-cli loki labels <datasource>")
-			}
-			ds, err := gc.FindDatasource(args[0], "loki")
-			if err != nil {
-				fatal("%v", err)
-			}
+			p := mustParse("usage: grafana-cli loki labels <datasource>", args, 1)
+			ds := findDS(gc, p.pos(0), "loki")
 			result, err := gc.LokiLabels(ds.UID)
 			if err != nil {
 				fatal("%v", err)
@@ -391,14 +363,9 @@ func main() {
 			fmt.Println(result)
 
 		case "label-values":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli loki label-values <datasource> <label>")
-			}
-			ds, err := gc.FindDatasource(args[0], "loki")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.LokiLabelValues(ds.UID, args[1])
+			p := mustParse("usage: grafana-cli loki label-values <datasource> <label>", args, 2)
+			ds := findDS(gc, p.pos(0), "loki")
+			result, err := gc.LokiLabelValues(ds.UID, p.pos(1))
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -417,38 +384,24 @@ func main() {
 
 		switch subcmd {
 		case "trace":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli tempo trace <datasource> <traceID>")
-			}
-			ds, err := gc.FindDatasource(args[0], "tempo")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.TempoTrace(ds.UID, args[1])
+			p := mustParse("usage: grafana-cli tempo trace <datasource> <traceID>", args, 2)
+			ds := findDS(gc, p.pos(0), "tempo")
+			result, err := gc.TempoTrace(ds.UID, p.pos(1))
 			if err != nil {
 				fatal("%v", err)
 			}
 			fmt.Print(result)
 
 		case "search":
-			if len(args) < 1 {
-				fatal("usage: grafana-cli tempo search <datasource> [--query <traceql>] [--start <t>] [--end <t>] [--limit <n>]")
-			}
-			dsName := args[0]
-			args = args[1:]
-			query, args := getFlag(args, "--query")
-			start, args := getFlag(args, "--start")
-			end, args := getFlag(args, "--end")
-			limitStr, _ := getFlag(args, "--limit")
-			limit := defaultLimit
-			if limitStr != "" {
-				limit, _ = strconv.Atoi(limitStr)
-			}
-			ds, err := gc.FindDatasource(dsName, "tempo")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.TempoSearch(ds.UID, query, parseTimeFlag(start), parseTimeFlag(end), limit)
+			usage := "usage: grafana-cli tempo search <datasource> [--query <traceql>] [--start <t>] [--end <t>] [--limit <n>]"
+			p := mustParse(usage, args, 1,
+				flag("--query", "TraceQL selector"),
+				timeFlag("--start", "window start (default: 1h ago)"),
+				timeFlag("--end", "window end (default: now)"),
+				intFlag("--limit", "max traces (default: 100)"))
+			ds := findDS(gc, p.pos(0), "tempo")
+			result, err := gc.TempoSearch(ds.UID, p.str("--query"), parseTimeFlag(p.str("--start")),
+				parseTimeFlag(p.str("--end")), p.intOr("--limit", defaultLimit))
 			if err != nil {
 				fatal("%v", err)
 			}
@@ -467,38 +420,28 @@ func main() {
 
 		switch subcmd {
 		case "query":
-			if len(args) < 2 {
-				fatal("usage: grafana-cli gcm query <datasource> <promql> --project <project> [--start <t>] [--end <t>] [--step <s>] [--format tsv]")
-			}
-			dsName := args[0]
-			query := args[1]
-			args = args[2:]
-			project, args := getFlag(args, "--project")
-			start, args := getFlag(args, "--start")
-			end, args := getFlag(args, "--end")
-			step, args := getFlag(args, "--step")
-			format, _ := getFlag(args, "--format")
+			usage := "usage: grafana-cli gcm query <datasource> <promql> --project <project> [--start <t>] [--end <t>] [--step <s>] [--format tsv]"
+			p := mustParse(usage, args, 2,
+				flag("--project", "GCP project ID (required)"),
+				timeFlag("--start", "window start (default: 1h ago)"),
+				timeFlag("--end", "window end (default: now)"),
+				stepFlag("--step", "resolution (default: "+defaultStep+")"),
+				formatFlag())
+			project := p.str("--project")
 			if project == "" {
-				fatal("--project is required (use 'gcm projects <datasource>' to list available projects)")
+				fatal("--project is required (use 'gcm projects <datasource>' to list available projects)\n  %s", usage)
 			}
-			ds, err := gc.FindDatasource(dsName, "stackdriver")
-			if err != nil {
-				fatal("%v", err)
-			}
-			result, err := gc.GCMQuery(ds.UID, project, query, parseTimeMS(start), parseTimeMS(end), step, format)
+			ds := findDS(gc, p.pos(0), "stackdriver")
+			result, err := gc.GCMQuery(ds.UID, project, p.pos(1), parseTimeMS(p.str("--start")),
+				parseTimeMS(p.str("--end")), p.str("--step"), p.str("--format"))
 			if err != nil {
 				fatal("%v", err)
 			}
 			fmt.Print(result)
 
 		case "projects":
-			if len(args) < 1 {
-				fatal("usage: grafana-cli gcm projects <datasource>")
-			}
-			ds, err := gc.FindDatasource(args[0], "stackdriver")
-			if err != nil {
-				fatal("%v", err)
-			}
+			p := mustParse("usage: grafana-cli gcm projects <datasource>", args, 1)
+			ds := findDS(gc, p.pos(0), "stackdriver")
 			result, err := gc.GCMProjects(ds.UID)
 			if err != nil {
 				fatal("%v", err)

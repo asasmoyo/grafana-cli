@@ -101,9 +101,9 @@ type gcmDsQueryResponse struct {
 }
 
 type gcmQueryResult struct {
-	Status int             `json:"status"`
-	Error  string          `json:"error"`
-	Frames []gcmDataFrame  `json:"frames"`
+	Status int            `json:"status"`
+	Error  string         `json:"error"`
+	Frames []gcmDataFrame `json:"frames"`
 }
 
 type gcmDataFrame struct {
@@ -112,9 +112,9 @@ type gcmDataFrame struct {
 }
 
 type gcmFrameSchema struct {
-	RefID  string         `json:"refId"`
-	Meta   gcmFrameMeta   `json:"meta"`
-	Fields []gcmField     `json:"fields"`
+	RefID  string       `json:"refId"`
+	Meta   gcmFrameMeta `json:"meta"`
+	Fields []gcmField   `json:"fields"`
 }
 
 type gcmFrameMeta struct {

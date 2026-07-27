@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -98,6 +99,44 @@ func (g *GrafanaClient) LokiLabelValues(dsUID string, label string) (string, err
 	return strings.Join(resp.Data, "\n"), nil
 }
 
+// lokiKeyLabels identify a workload in most deployments and are shown first
+// when present. They are a display preference, not a filter: a stream using
+// none of them still shows its own labels, so a Loki keyed by host/filename/
+// unit is not reduced to "{}".
+var lokiKeyLabels = []string{"namespace", "pod", "container", "service_name", "component", "job", "stream"}
+
+// maxStreamLabels caps the fallback so that one widely-labelled stream cannot
+// dominate the output.
+const maxStreamLabels = 4
+
+func formatStreamLabels(stream map[string]string) string {
+	var parts []string
+	for _, k := range lokiKeyLabels {
+		if v, ok := stream[k]; ok {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, ", ")
+	}
+
+	// Unrecognised labelling scheme: show what the stream actually has, sorted
+	// for stable output.
+	keys := make([]string, 0, len(stream))
+	for k := range stream {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if len(parts) == maxStreamLabels {
+			parts = append(parts, fmt.Sprintf("(+%d labels)", len(keys)-maxStreamLabels))
+			break
+		}
+		parts = append(parts, k+"="+stream[k])
+	}
+	return strings.Join(parts, ", ")
+}
+
 // --- Loki formatters ---
 
 func formatLokiResponse(body []byte, format string) (string, error) {
@@ -142,19 +181,8 @@ func formatLokiResponse(body []byte, format string) (string, error) {
 		return sb.String(), nil
 	}
 
-	// Build compact label representation for each stream
-	// showing only the most useful labels for log identification
-	lokiKeyLabels := []string{"namespace", "pod", "container", "service_name", "component", "job", "stream"}
-
 	for _, stream := range resp.Data.Result {
-		// Show only key labels for compact log output
-		var labelParts []string
-		for _, k := range lokiKeyLabels {
-			if v, ok := stream.Stream[k]; ok {
-				labelParts = append(labelParts, k+"="+v)
-			}
-		}
-		labels := strings.Join(labelParts, ", ")
+		labels := formatStreamLabels(stream.Stream)
 
 		for _, entry := range stream.Values {
 			if len(entry) < 2 {

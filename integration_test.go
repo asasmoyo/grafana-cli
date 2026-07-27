@@ -1,7 +1,8 @@
+//go:build integration
+
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,30 +12,54 @@ import (
 	"time"
 )
 
-// Integration tests for grafana-cli.
+// Contract tests for grafana-cli, run against a live Grafana.
 //
-// These tests require a live Grafana instance with Prometheus, Loki, and Tempo
-// datasources configured. Set the following environment variables:
+// These are the only tests that can detect the datasource API contract moving
+// underneath us — a route being removed (as the numeric-id datasource routes
+// were in Grafana 13), a response shape changing, or a token losing a
+// permission. Everything provable without a server lives in client_test.go,
+// cli_test.go, flags_test.go, helpers_test.go and gcm_test.go and runs on every
+// `go test ./...`.
 //
-//   GRAFANA_URL=http://localhost:8080
-//   GRAFANA_TOKEN=<service-account-token>
+// They are behind a build tag rather than a runtime skip on purpose: a suite
+// that quietly skips reports success while proving nothing, which is how a
+// broken client reached staging. `go test ./...` therefore never reports these
+// as skipped, and asking for them without credentials is an error, not a no-op.
 //
-// Run with: go test -v -tags integration -run TestIntegration
+//	GRAFANA_URL=https://grafana.example.com \
+//	GRAFANA_TOKEN=<service-account-token> \
+//	go test -tags integration -v -run TestIntegration ./...
 //
-// The tests are designed to be run against a Grafana instance (e.g. via
-// kubectl port-forward) with Prometheus, Loki, and Tempo datasources
-// configured.
+// Nothing here is specific to one deployment: datasources, labels, label values
+// and projects are all discovered at run time, and a test skips with an explicit
+// reason when the target Grafana has nothing to exercise it with. Where a
+// deployment has several candidates, or where discovery cannot infer a
+// meaningful query, point the suite at the right object:
+//
+//	GRAFANA_TEST_PROMETHEUS_DS   uid or name of the Prometheus datasource to use
+//	GRAFANA_TEST_LOKI_DS         uid or name of the Loki datasource to use
+//	GRAFANA_TEST_TEMPO_DS        uid or name of the Tempo datasource to use
+//	GRAFANA_TEST_STACKDRIVER_DS  uid or name of the Cloud Monitoring datasource
+//	GRAFANA_TEST_GCM_PROJECT     GCP project to query (default: first discovered)
+//	GRAFANA_TEST_GCM_EXPR        GCM PromQL expression to query
+//
+// Run against every Grafana version you support before rolling out a change to
+// datasource addressing or resolution.
 
-func skipIfNoGrafana(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+func requireGrafana(t *testing.T) {
 	t.Helper()
 	if os.Getenv("GRAFANA_URL") == "" || os.Getenv("GRAFANA_TOKEN") == "" {
-		t.Skip("GRAFANA_URL and GRAFANA_TOKEN must be set for integration tests")
+		t.Fatal("GRAFANA_URL and GRAFANA_TOKEN must be set: the integration build tag asks for tests that need a live Grafana")
 	}
 }
 
 func mustClient(t *testing.T) *GrafanaClient {
 	t.Helper()
-	skipIfNoGrafana(t)
+	requireGrafana(t)
 	gc, err := NewGrafanaClient()
 	if err != nil {
 		t.Fatalf("NewGrafanaClient: %v", err)
@@ -42,36 +67,59 @@ func mustClient(t *testing.T) *GrafanaClient {
 	return gc
 }
 
-func mustFindDatasource(t *testing.T, gc *GrafanaClient, name, dsType string) *Datasource {
+// datasourceOfType returns a datasource to exercise for the given type. It
+// prefers an explicitly configured one, falls back to the first of that type,
+// and skips the test when the deployment has none — a Grafana without Tempo is
+// a valid deployment, not a failure.
+func datasourceOfType(t *testing.T, gc *GrafanaClient, dsType string) *Datasource {
 	t.Helper()
-	ds, err := gc.FindDatasource(name, dsType)
-	if err != nil {
-		t.Fatalf("FindDatasource(%q, %q): %v", name, dsType, err)
+
+	envVar := "GRAFANA_TEST_" + strings.ToUpper(dsType) + "_DS"
+	if selector := os.Getenv(envVar); selector != "" {
+		ds, err := gc.FindDatasource(selector, dsType)
+		if err != nil {
+			t.Fatalf("%s=%q: %v", envVar, selector, err)
+		}
+		return ds
 	}
-	return ds
+
+	all, err := gc.ListDatasources()
+	if err != nil {
+		t.Fatalf("ListDatasources: %v", err)
+	}
+	for i := range all {
+		if typeMatches(all[i], dsType) {
+			return &all[i]
+		}
+	}
+	t.Skipf("no %s datasource configured on %s — set %s to pin one",
+		dsType, os.Getenv("GRAFANA_URL"), envVar)
+	return nil
+}
+
+// nonEmptyLines splits a command result, failing when it produced nothing.
+func nonEmptyLines(t *testing.T, what, result string) []string {
+	t.Helper()
+	trimmed := strings.TrimSpace(result)
+	if trimmed == "" {
+		t.Fatalf("%s returned no output", what)
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+// isSentinel reports whether a result is one of the documented "successful but
+// empty" markers. Tests treat these as "nothing to assert on here".
+func isSentinel(result string) bool {
+	switch strings.TrimSpace(result) {
+	case "(no results)", "(no data)", "(no log lines found)", "(no traces found)", "(no projects found)":
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
-// Client & Datasource discovery
+// Client, discovery and selectors
 // ---------------------------------------------------------------------------
-
-func TestIntegrationNewGrafanaClient(t *testing.T) {
-	skipIfNoGrafana(t)
-
-	gc, err := NewGrafanaClient()
-	if err != nil {
-		t.Fatalf("NewGrafanaClient failed: %v", err)
-	}
-	if gc.baseURL == "" {
-		t.Error("baseURL is empty")
-	}
-	if gc.token == "" {
-		t.Error("token is empty")
-	}
-	if gc.client == nil {
-		t.Error("http client is nil")
-	}
-}
 
 func TestIntegrationListDatasources(t *testing.T) {
 	gc := mustClient(t)
@@ -84,89 +132,96 @@ func TestIntegrationListDatasources(t *testing.T) {
 		t.Fatal("expected at least one datasource")
 	}
 
-	// Verify sorted by ID
-	for i := 1; i < len(datasources); i++ {
-		if datasources[i].ID < datasources[i-1].ID {
-			t.Errorf("datasources not sorted by ID: [%d].ID=%d < [%d].ID=%d",
-				i, datasources[i].ID, i-1, datasources[i-1].ID)
-		}
-	}
-
-	// Verify required fields are populated
-	for _, ds := range datasources {
-		if ds.ID == 0 {
-			t.Error("datasource has zero ID")
-		}
+	for i, ds := range datasources {
+		// The uid is the identity every query route uses, so it is the one
+		// field this CLI cannot work without.
 		if ds.UID == "" {
-			t.Errorf("datasource %d has empty UID", ds.ID)
+			t.Errorf("datasource %q has no uid", ds.Name)
 		}
 		if ds.Name == "" {
-			t.Errorf("datasource %d has empty Name", ds.ID)
+			t.Errorf("datasource %s has no name", ds.UID)
 		}
 		if ds.Type == "" {
-			t.Errorf("datasource %d has empty Type", ds.ID)
+			t.Errorf("datasource %s has no type", ds.UID)
+		}
+		if i > 0 && strings.ToLower(ds.Name) < strings.ToLower(datasources[i-1].Name) {
+			t.Errorf("datasources not sorted by name: %q before %q", datasources[i-1].Name, ds.Name)
 		}
 	}
 
-	t.Logf("found %d datasources", len(datasources))
+	types := map[string]int{}
+	for _, ds := range datasources {
+		types[ds.Type]++
+	}
+	t.Logf("%d datasources: %v", len(datasources), types)
 }
 
-func TestIntegrationFindDatasource(t *testing.T) {
+// The selector contract, checked against whatever this deployment actually has.
+func TestIntegrationDatasourceSelectors(t *testing.T) {
 	gc := mustClient(t)
 
-	t.Run("by_name", func(t *testing.T) {
-		ds, err := gc.FindDatasource("Prometheus", "prometheus")
+	all, err := gc.ListDatasources()
+	if err != nil {
+		t.Fatalf("ListDatasources: %v", err)
+	}
+	subject := all[0]
+
+	t.Run("by_uid", func(t *testing.T) {
+		ds, err := gc.FindDatasource(subject.UID, "")
 		if err != nil {
-			t.Fatalf("FindDatasource by name: %v", err)
+			t.Fatalf("FindDatasource(%q): %v", subject.UID, err)
 		}
-		if !strings.Contains(strings.ToLower(ds.Type), "prometheus") {
-			t.Errorf("expected prometheus type, got %q", ds.Type)
+		if ds.UID != subject.UID {
+			t.Errorf("resolved to %q, want %q", ds.UID, subject.UID)
 		}
 	})
 
-	t.Run("by_id", func(t *testing.T) {
-		// First find it by name to get the ID
-		ds, err := gc.FindDatasource("Prometheus", "prometheus")
+	t.Run("by_exact_name", func(t *testing.T) {
+		ds, err := gc.FindDatasource(subject.Name, subject.Type)
 		if err != nil {
-			t.Fatalf("FindDatasource: %v", err)
+			t.Fatalf("FindDatasource(%q): %v", subject.Name, err)
 		}
-		// Then find by ID
-		ds2, err := gc.FindDatasource(strconv.Itoa(ds.ID), "")
-		if err != nil {
-			t.Fatalf("FindDatasource by ID: %v", err)
-		}
-		if ds2.ID != ds.ID {
-			t.Errorf("ID mismatch: got %d, want %d", ds2.ID, ds.ID)
+		if ds.Type != subject.Type {
+			t.Errorf("resolved to type %q, want %q", ds.Type, subject.Type)
 		}
 	})
 
-	t.Run("by_type", func(t *testing.T) {
-		ds, err := gc.FindDatasource("loki", "")
-		if err != nil {
-			t.Fatalf("FindDatasource by type: %v", err)
+	t.Run("by_numeric_id", func(t *testing.T) {
+		if subject.ID == 0 {
+			t.Skipf("%s reports no numeric id (expected on Grafana 13+)", os.Getenv("GRAFANA_URL"))
 		}
-		if !strings.Contains(strings.ToLower(ds.Type), "loki") {
-			t.Errorf("expected loki type, got %q", ds.Type)
+		ds, err := gc.FindDatasource(strconv.Itoa(subject.ID), "")
+		if err != nil {
+			t.Fatalf("FindDatasource(%d): %v", subject.ID, err)
+		}
+		if ds.UID != subject.UID {
+			t.Errorf("resolved to %q, want %q", ds.UID, subject.UID)
 		}
 	})
 
-	t.Run("partial_name", func(t *testing.T) {
-		ds, err := gc.FindDatasource("prom", "prometheus")
-		if err != nil {
-			t.Fatalf("FindDatasource partial: %v", err)
+	t.Run("wrong_type_is_rejected", func(t *testing.T) {
+		var other *Datasource
+		for i := range all {
+			if all[i].Type != subject.Type {
+				other = &all[i]
+				break
+			}
 		}
-		if !strings.Contains(strings.ToLower(ds.Type), "prometheus") {
-			t.Errorf("expected prometheus type, got %q", ds.Type)
+		if other == nil {
+			t.Skip("deployment has only one datasource type")
+		}
+		if _, err := gc.FindDatasource(other.UID, subject.Type); err == nil {
+			t.Errorf("resolving %s (%s) as a %q datasource should have failed", other.UID, other.Type, subject.Type)
 		}
 	})
 
-	t.Run("not_found", func(t *testing.T) {
+	t.Run("unknown_selector", func(t *testing.T) {
 		_, err := gc.FindDatasource("nonexistent-ds-xyz-123", "")
 		if err == nil {
-			t.Error("expected error for nonexistent datasource")
+			t.Fatal("expected an error for an unknown datasource")
 		}
 		if !strings.Contains(err.Error(), "not found") {
-			t.Errorf("expected 'not found' in error, got: %v", err)
+			t.Errorf("expected 'not found', got: %v", err)
 		}
 	})
 }
@@ -175,63 +230,62 @@ func TestIntegrationFindDatasource(t *testing.T) {
 // Prometheus
 // ---------------------------------------------------------------------------
 
-func TestIntegrationPromQueryInstant(t *testing.T) {
+func TestIntegrationPrometheus(t *testing.T) {
 	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
+	ds := datasourceOfType(t, gc, "prometheus")
 
-	t.Run("simple_query", func(t *testing.T) {
-		result, err := gc.PromQueryInstant(ds.UID, "count(up)", "", "")
+	// vector(1) is answered by every Prometheus-compatible backend regardless of
+	// what is being scraped, so it tests the route rather than the deployment.
+	t.Run("instant_query", func(t *testing.T) {
+		result, err := gc.PromQueryInstant(ds.UID, "vector(1)", "", "")
 		if err != nil {
 			t.Fatalf("PromQueryInstant: %v", err)
 		}
-		if result == "(no results)" {
-			t.Fatal("expected results for count(up)")
+		if isSentinel(result) {
+			t.Fatalf("vector(1) returned %q", result)
 		}
 		if !strings.Contains(result, "VALUE") {
-			t.Error("expected VALUE header in tabwriter output")
+			t.Errorf("expected a VALUE column, got: %s", truncate(result, 200))
 		}
-		// count(up) should return a number > 0
-		lines := strings.Split(strings.TrimSpace(result), "\n")
-		if len(lines) < 2 {
-			t.Fatalf("expected at least header + 1 row, got %d lines", len(lines))
-		}
-		t.Logf("count(up) result: %s", strings.TrimSpace(lines[1]))
 	})
 
-	t.Run("with_timestamp", func(t *testing.T) {
+	t.Run("instant_query_at_a_timestamp", func(t *testing.T) {
 		ts := fmt.Sprintf("%d", time.Now().Add(-30*time.Minute).Unix())
-		result, err := gc.PromQueryInstant(ds.UID, "count(up)", ts, "")
+		result, err := gc.PromQueryInstant(ds.UID, "vector(1)", ts, "")
 		if err != nil {
-			t.Fatalf("PromQueryInstant with timestamp: %v", err)
+			t.Fatalf("PromQueryInstant at %s: %v", ts, err)
 		}
-		if result == "(no results)" {
-			t.Fatal("expected results for count(up) at -30m")
+		if isSentinel(result) {
+			t.Errorf("vector(1) at -30m returned %q", result)
 		}
 	})
 
-	t.Run("label_filtering", func(t *testing.T) {
-		result, err := gc.PromQueryInstant(ds.UID, "up{job=\"kubernetes-nodes\"}", "", "")
+	t.Run("range_query", func(t *testing.T) {
+		now := time.Now().UTC()
+		result, err := gc.PromQueryRange(ds.UID, "vector(1)",
+			fmt.Sprintf("%d", now.Add(-1*time.Hour).Unix()),
+			fmt.Sprintf("%d", now.Unix()), "5m", "")
 		if err != nil {
-			t.Fatalf("PromQueryInstant: %v", err)
+			t.Fatalf("PromQueryRange: %v", err)
 		}
-		// Compact output should hide noisy k8s labels
-		if strings.Contains(result, "beta_kubernetes_io_") {
-			t.Error("noisy label beta_kubernetes_io_ should be filtered in compact output")
-		}
-		if strings.Contains(result, "cloud_google_com_") {
-			t.Error("noisy label cloud_google_com_ should be filtered in compact output")
-		}
-		// Should show the (+N labels) indicator
-		if !strings.Contains(result, "(+") || !strings.Contains(result, "labels)") {
-			t.Error("expected (+N labels) indicator for hidden labels")
-		}
-		// Important labels should still be present
-		if !strings.Contains(result, "job=") {
-			t.Error("expected 'job=' label in output")
+		for _, want := range []string{"TIME", "VALUE", "samples"} {
+			if !strings.Contains(result, want) {
+				t.Errorf("expected %q in matrix output, got: %s", want, truncate(result, 200))
+			}
 		}
 	})
 
-	t.Run("no_results", func(t *testing.T) {
+	t.Run("range_query_defaults", func(t *testing.T) {
+		result, err := gc.PromQueryRange(ds.UID, "vector(1)", "", "", "", "")
+		if err != nil {
+			t.Fatalf("PromQueryRange with defaults: %v", err)
+		}
+		if isSentinel(result) {
+			t.Error("expected results for vector(1) over the default range")
+		}
+	})
+
+	t.Run("empty_result_sentinel", func(t *testing.T) {
 		result, err := gc.PromQueryInstant(ds.UID, "nonexistent_metric_xyz_12345", "", "")
 		if err != nil {
 			t.Fatalf("PromQueryInstant: %v", err)
@@ -240,1213 +294,316 @@ func TestIntegrationPromQueryInstant(t *testing.T) {
 			t.Errorf("expected '(no results)', got: %s", truncate(result, 100))
 		}
 	})
-}
 
-func TestIntegrationPromQueryRange(t *testing.T) {
-	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
+	// Label discovery drives the remaining subtests, so they work against any
+	// Prometheus regardless of what it scrapes.
+	labels := nonEmptyLines(t, "PromLabels", mustPromLabels(t, gc, ds))
 
-	now := time.Now().UTC()
-	start := fmt.Sprintf("%d", now.Add(-1*time.Hour).Unix())
-	end := fmt.Sprintf("%d", now.Unix())
-
-	t.Run("basic_range", func(t *testing.T) {
-		result, err := gc.PromQueryRange(ds.UID,
-			`sum(rate(container_cpu_usage_seconds_total{namespace="default"}[5m])) by (pod)`,
-			start, end, "5m", "")
-		if err != nil {
-			t.Fatalf("PromQueryRange: %v", err)
+	t.Run("labels", func(t *testing.T) {
+		// __name__ is part of the Prometheus data model, not of any deployment.
+		for _, l := range labels {
+			if l == "__name__" {
+				t.Logf("%d labels", len(labels))
+				return
+			}
 		}
-		if result == "(no results)" {
-			t.Skip("no CPU metrics in default namespace")
-		}
-		// Matrix output should have time-series sections
-		if !strings.Contains(result, "──") {
-			t.Error("expected series header (──) in matrix output")
-		}
-		if !strings.Contains(result, "TIME") {
-			t.Error("expected TIME column header")
-		}
-		if !strings.Contains(result, "VALUE") {
-			t.Error("expected VALUE column header")
-		}
-		if !strings.Contains(result, "samples") {
-			t.Error("expected 'samples' count in series header")
-		}
-		t.Logf("result preview: %s", truncate(result, 300))
+		t.Errorf("expected __name__ among %d labels", len(labels))
 	})
 
-	t.Run("defaults_without_params", func(t *testing.T) {
-		// Empty start/end/step should default to 1h range, 60s step
-		result, err := gc.PromQueryRange(ds.UID, "count(up)", "", "", "", "")
-		if err != nil {
-			t.Fatalf("PromQueryRange defaults: %v", err)
+	t.Run("label_values", func(t *testing.T) {
+		label := firstUsableLabel(labels)
+		if label == "" {
+			t.Skip("no non-reserved label to query values for")
 		}
-		if result == "(no results)" {
-			t.Fatal("expected results for count(up) with default range")
+		result, err := gc.PromLabelValues(ds.UID, label)
+		if err != nil {
+			t.Fatalf("PromLabelValues(%q): %v", label, err)
+		}
+		values := nonEmptyLines(t, "PromLabelValues", result)
+		t.Logf("label %q has %d values", label, len(values))
+	})
+
+	t.Run("series", func(t *testing.T) {
+		label := firstUsableLabel(labels)
+		if label == "" {
+			t.Skip("no non-reserved label to build a selector from")
+		}
+		values, err := gc.PromLabelValues(ds.UID, label)
+		if err != nil || strings.TrimSpace(values) == "" {
+			t.Skipf("no values for label %q", label)
+		}
+		value := strings.Split(strings.TrimSpace(values), "\n")[0]
+		selector := fmt.Sprintf("{%s=%q}", label, value)
+
+		result, err := gc.PromSeries(ds.UID, selector)
+		if err != nil {
+			t.Fatalf("PromSeries(%s): %v", selector, err)
+		}
+		if strings.TrimSpace(result) == "" {
+			t.Errorf("expected series for %s", selector)
 		}
 	})
 }
 
-func TestIntegrationPromLabels(t *testing.T) {
-	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
-
+func mustPromLabels(t *testing.T, gc *GrafanaClient, ds *Datasource) string {
+	t.Helper()
 	result, err := gc.PromLabels(ds.UID)
 	if err != nil {
 		t.Fatalf("PromLabels: %v", err)
 	}
+	return result
+}
 
-	labels := strings.Split(strings.TrimSpace(result), "\n")
-	if len(labels) < 10 {
-		t.Fatalf("expected many labels, got %d", len(labels))
-	}
-
-	// Standard Prometheus labels should be present
-	found := map[string]bool{}
+// firstUsableLabel picks a label suitable for building a selector, skipping
+// Prometheus' reserved names.
+func firstUsableLabel(labels []string) string {
 	for _, l := range labels {
-		found[l] = true
-	}
-	for _, expected := range []string{"__name__", "job", "instance", "namespace"} {
-		if !found[expected] {
-			t.Errorf("expected label %q not found", expected)
+		if !strings.HasPrefix(l, "__") {
+			return l
 		}
 	}
-
-	t.Logf("found %d labels", len(labels))
-}
-
-func TestIntegrationPromLabelValues(t *testing.T) {
-	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
-
-	result, err := gc.PromLabelValues(ds.UID, "namespace")
-	if err != nil {
-		t.Fatalf("PromLabelValues: %v", err)
-	}
-
-	values := strings.Split(strings.TrimSpace(result), "\n")
-	if len(values) == 0 {
-		t.Fatal("expected at least one namespace value")
-	}
-
-	found := false
-	for _, v := range values {
-		if v == "default" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected 'default' namespace in label values")
-	}
-
-	t.Logf("found %d namespace values: %v", len(values), values)
-}
-
-func TestIntegrationPromSeries(t *testing.T) {
-	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Prometheus", "prometheus")
-
-	result, err := gc.PromSeries(ds.UID, `{__name__="up",job="kubernetes-nodes"}`)
-	if err != nil {
-		t.Fatalf("PromSeries: %v", err)
-	}
-
-	lines := strings.Split(strings.TrimSpace(result), "\n")
-	if len(lines) == 0 {
-		t.Fatal("expected at least one series")
-	}
-
-	// Each line should contain the metric name and key labels
-	for _, line := range lines[:min(3, len(lines))] {
-		if !strings.Contains(line, "up") {
-			t.Errorf("expected 'up' metric name in series line: %s", truncate(line, 100))
-		}
-		if !strings.Contains(line, "job=kubernetes-nodes") {
-			t.Errorf("expected 'job=kubernetes-nodes' in series line: %s", truncate(line, 100))
-		}
-		// Compact filtering should be applied
-		if strings.Contains(line, "beta_kubernetes_io_") {
-			t.Error("noisy labels should be filtered in series output")
-		}
-	}
-
-	t.Logf("found %d series", len(lines))
+	return ""
 }
 
 // ---------------------------------------------------------------------------
 // Loki
 // ---------------------------------------------------------------------------
 
-func TestIntegrationLokiQuery(t *testing.T) {
+func TestIntegrationLoki(t *testing.T) {
 	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Loki", "loki")
+	ds := datasourceOfType(t, gc, "loki")
+
+	labelsResult, err := gc.LokiLabels(ds.UID)
+	if err != nil {
+		t.Fatalf("LokiLabels: %v", err)
+	}
+	labels := nonEmptyLines(t, "LokiLabels", labelsResult)
+	t.Logf("%d loki labels", len(labels))
+
+	label := firstUsableLabel(labels)
+	if label == "" {
+		t.Skip("loki reports no usable stream label")
+	}
+
+	valuesResult, err := gc.LokiLabelValues(ds.UID, label)
+	if err != nil {
+		t.Fatalf("LokiLabelValues(%q): %v", label, err)
+	}
+	values := nonEmptyLines(t, "LokiLabelValues", valuesResult)
+	selector := fmt.Sprintf("{%s=%q}", label, values[0])
+	t.Logf("querying with discovered selector %s", selector)
 
 	now := time.Now().UTC()
 	start := fmt.Sprintf("%d", now.Add(-30*time.Minute).UnixNano())
 	end := fmt.Sprintf("%d", now.UnixNano())
 
-	t.Run("basic_query", func(t *testing.T) {
-		result, err := gc.LokiQuery(ds.UID, `{namespace="default"}`, start, end, 5, "", "")
+	t.Run("query", func(t *testing.T) {
+		result, err := gc.LokiQuery(ds.UID, selector, start, end, 5, "", "")
 		if err != nil {
-			t.Fatalf("LokiQuery: %v", err)
+			t.Fatalf("LokiQuery(%s): %v", selector, err)
 		}
-		if result == "(no log lines found)" {
-			t.Skip("no logs in default namespace in last 30m")
-		}
-		// Should contain formatted log lines
-		if !strings.Contains(result, "[") || !strings.Contains(result, "]") {
-			t.Error("expected timestamped log lines with brackets")
+		if isSentinel(result) {
+			t.Skipf("no log lines for %s in the last 30m", selector)
 		}
 		if !strings.Contains(result, "log lines returned") {
-			t.Error("expected summary line '--- N log lines returned ---'")
-		}
-
-		// Verify compact labels — should only show key labels
-		lines := strings.Split(result, "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "[") {
-				if !strings.Contains(line, "namespace=") {
-					t.Error("expected 'namespace=' in log line labels")
-				}
-				// Should NOT have filename (not in the compact label set)
-				if strings.Contains(line, "filename=") {
-					t.Error("filename should not appear in compact loki labels")
-				}
-				break
-			}
-		}
-
-		t.Logf("result preview: %s", truncate(result, 300))
-	})
-
-	t.Run("with_filter", func(t *testing.T) {
-		result, err := gc.LokiQuery(ds.UID, `{namespace="default"} |= "error"`, start, end, 3, "", "")
-		if err != nil {
-			t.Fatalf("LokiQuery with filter: %v", err)
-		}
-		// Either we get results containing "error" or no results
-		if result != "(no log lines found)" {
-			lines := strings.Split(result, "\n")
-			foundError := false
-			for _, line := range lines {
-				if strings.HasPrefix(line, "[") && strings.Contains(strings.ToLower(line), "error") {
-					foundError = true
-					break
-				}
-			}
-			if !foundError {
-				t.Error("expected 'error' in filtered log lines")
-			}
+			t.Errorf("expected a line count footer, got: %s", truncate(result, 200))
 		}
 	})
 
-	t.Run("defaults_without_params", func(t *testing.T) {
-		// Empty start/end should default to last 1h
-		result, err := gc.LokiQuery(ds.UID, `{namespace="default"}`, "", "", 3, "", "")
-		if err != nil {
-			t.Fatalf("LokiQuery defaults: %v", err)
-		}
-		// Should return something (even if no results)
-		if result == "" {
-			t.Error("expected non-empty response")
-		}
-	})
-
-	t.Run("limit_respected", func(t *testing.T) {
-		result, err := gc.LokiQuery(ds.UID, `{namespace="default"}`, start, end, 2, "", "")
+	t.Run("limit_is_respected", func(t *testing.T) {
+		result, err := gc.LokiQuery(ds.UID, selector, start, end, 2, "", "tsv")
 		if err != nil {
 			t.Fatalf("LokiQuery: %v", err)
 		}
-		if result == "(no log lines found)" {
-			t.Skip("no logs available")
+		if isSentinel(result) {
+			t.Skipf("no log lines for %s in the last 30m", selector)
 		}
-		// Count actual log lines (lines starting with [timestamp])
-		count := 0
-		for _, line := range strings.Split(result, "\n") {
-			if strings.HasPrefix(line, "[") {
-				count++
-			}
-		}
-		if count > 2 {
-			t.Errorf("expected at most 2 log lines, got %d", count)
+		if n := len(nonEmptyLines(t, "LokiQuery", result)); n > 2 {
+			t.Errorf("--limit 2 returned %d lines", n)
 		}
 	})
-}
 
-func TestIntegrationLokiLabels(t *testing.T) {
-	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Loki", "loki")
-
-	result, err := gc.LokiLabels(ds.UID)
-	if err != nil {
-		t.Fatalf("LokiLabels: %v", err)
-	}
-
-	labels := strings.Split(strings.TrimSpace(result), "\n")
-	if len(labels) < 3 {
-		t.Fatalf("expected several labels, got %d", len(labels))
-	}
-
-	found := map[string]bool{}
-	for _, l := range labels {
-		found[l] = true
-	}
-	for _, expected := range []string{"namespace", "pod", "container"} {
-		if !found[expected] {
-			t.Errorf("expected label %q not found", expected)
+	t.Run("count", func(t *testing.T) {
+		result, err := gc.LokiCount(ds.UID, selector, start, end, "5m", "")
+		if err != nil {
+			t.Fatalf("LokiCount: %v", err)
 		}
-	}
-
-	t.Logf("found %d loki labels", len(labels))
-}
-
-func TestIntegrationLokiLabelValues(t *testing.T) {
-	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Loki", "loki")
-
-	result, err := gc.LokiLabelValues(ds.UID, "namespace")
-	if err != nil {
-		t.Fatalf("LokiLabelValues: %v", err)
-	}
-
-	values := strings.Split(strings.TrimSpace(result), "\n")
-	if len(values) == 0 {
-		t.Fatal("expected at least one namespace value")
-	}
-
-	found := false
-	for _, v := range values {
-		if v == "default" {
-			found = true
-			break
+		if isSentinel(result) {
+			t.Skipf("no log volume for %s in the last 30m", selector)
 		}
-	}
-	if !found {
-		t.Error("expected 'default' namespace in loki label values")
-	}
-
-	t.Logf("found %d loki namespace values", len(values))
+		if !strings.Contains(result, "total:") {
+			t.Errorf("expected a total footer, got: %s", truncate(result, 200))
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
 // Tempo
 // ---------------------------------------------------------------------------
 
-func TestIntegrationTempoSearch(t *testing.T) {
+func TestIntegrationTempo(t *testing.T) {
 	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Tempo", "tempo")
+	ds := datasourceOfType(t, gc, "tempo")
 
 	now := time.Now().UTC()
 	start := fmt.Sprintf("%d", now.Add(-1*time.Hour).Unix())
 	end := fmt.Sprintf("%d", now.Unix())
 
-	t.Run("basic_search", func(t *testing.T) {
-		result, err := gc.TempoSearch(ds.UID, "", start, end, 5)
-		if err != nil {
-			t.Fatalf("TempoSearch: %v", err)
-		}
-		if result == "(no traces found)" {
-			t.Skip("no traces in last hour")
-		}
-		// Table output should have headers
-		if !strings.Contains(result, "TRACE_ID") {
-			t.Error("expected TRACE_ID header")
-		}
-		if !strings.Contains(result, "SERVICE") {
-			t.Error("expected SERVICE header")
-		}
-		if !strings.Contains(result, "DURATION") {
-			t.Error("expected DURATION header")
-		}
-		if !strings.Contains(result, "traces ---") {
-			t.Error("expected '--- N traces ---' summary")
-		}
+	result, err := gc.TempoSearch(ds.UID, "", start, end, 5)
+	if err != nil {
+		t.Fatalf("TempoSearch: %v", err)
+	}
+	if isSentinel(result) {
+		t.Skip("no traces in the last hour")
+	}
+	if !strings.Contains(result, "TRACE_ID") {
+		t.Fatalf("expected a TRACE_ID column, got: %s", truncate(result, 200))
+	}
 
-		t.Logf("result preview: %s", truncate(result, 400))
-	})
-
-	t.Run("with_query", func(t *testing.T) {
-		result, err := gc.TempoSearch(ds.UID, "{}", start, end, 3)
+	t.Run("trace_by_id", func(t *testing.T) {
+		traceID := firstTraceID(result)
+		if traceID == "" {
+			t.Skip("could not extract a trace id from the search results")
+		}
+		trace, err := gc.TempoTrace(ds.UID, traceID)
 		if err != nil {
-			t.Fatalf("TempoSearch with query: %v", err)
+			t.Fatalf("TempoTrace(%s): %v", traceID, err)
 		}
-		// Should return valid output (either traces or no traces)
-		if result == "" {
-			t.Error("expected non-empty response")
-		}
-	})
-
-	t.Run("defaults_without_params", func(t *testing.T) {
-		result, err := gc.TempoSearch(ds.UID, "", "", "", 3)
-		if err != nil {
-			t.Fatalf("TempoSearch defaults: %v", err)
-		}
-		if result == "" {
-			t.Error("expected non-empty response")
+		if strings.TrimSpace(trace) == "" {
+			t.Errorf("trace %s came back empty", traceID)
 		}
 	})
 }
 
-func TestIntegrationTempoTrace(t *testing.T) {
-	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Tempo", "tempo")
-
-	// First find a trace ID via search
-	now := time.Now().UTC()
-	start := fmt.Sprintf("%d", now.Add(-1*time.Hour).Unix())
-	end := fmt.Sprintf("%d", now.Unix())
-
-	searchResult, err := gc.TempoSearch(ds.UID, "", start, end, 5)
-	if err != nil {
-		t.Fatalf("TempoSearch for trace IDs: %v", err)
+// firstTraceID reads a trace id out of the search table, skipping the header.
+func firstTraceID(searchOutput string) string {
+	for i, line := range strings.Split(strings.TrimSpace(searchOutput), "\n") {
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue
+		}
+		if fields := strings.Fields(line); len(fields) > 0 {
+			return fields[0]
+		}
 	}
-	if searchResult == "(no traces found)" {
-		t.Skip("no traces available to fetch")
-	}
-
-	// Parse a trace ID from the search output (second line, first column)
-	lines := strings.Split(strings.TrimSpace(searchResult), "\n")
-	if len(lines) < 2 {
-		t.Fatalf("expected at least header + 1 trace, got %d lines", len(lines))
-	}
-	traceID := strings.Fields(lines[1])[0]
-	if traceID == "" || traceID == "TRACE_ID" {
-		t.Fatalf("could not parse trace ID from search output")
-	}
-
-	t.Run("fetch_trace", func(t *testing.T) {
-		result, err := gc.TempoTrace(ds.UID, traceID)
-		if err != nil {
-			t.Fatalf("TempoTrace(%s): %v", traceID, err)
-		}
-		if result == "(no spans found in trace)" {
-			t.Fatalf("expected spans in trace %s", traceID)
-		}
-		// Should contain span output
-		if !strings.Contains(result, "span=") {
-			t.Error("expected 'span=' in trace output")
-		}
-		if !strings.Contains(result, "spans ---") {
-			t.Error("expected '--- N spans ---' summary")
-		}
-		// Should contain service names and status
-		if !strings.Contains(result, "[OK/") && !strings.Contains(result, "[ERROR/") {
-			t.Error("expected [OK/...] or [ERROR/...] status in span output")
-		}
-		// Should contain timestamps
-		if !strings.Contains(result, "[") || !strings.Contains(result, "]") {
-			t.Error("expected timestamps in brackets")
-		}
-
-		t.Logf("trace %s preview: %s", traceID, truncate(result, 400))
-	})
-
-	t.Run("nonexistent_trace", func(t *testing.T) {
-		// Tempo returns 404 or empty for nonexistent traces
-		_, err := gc.TempoTrace(ds.UID, "00000000000000000000000000000000")
-		// Either an error or empty result is acceptable
-		if err != nil {
-			t.Logf("nonexistent trace returned error (expected): %v", err)
-		}
-	})
+	return ""
 }
 
 // ---------------------------------------------------------------------------
 // Google Cloud Monitoring
 // ---------------------------------------------------------------------------
 
-func TestIntegrationGCMProjects(t *testing.T) {
+func TestIntegrationGCM(t *testing.T) {
 	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Google Cloud Monitoring", "stackdriver")
+	ds := datasourceOfType(t, gc, "stackdriver")
 
 	result, err := gc.GCMProjects(ds.UID)
 	if err != nil {
 		t.Fatalf("GCMProjects: %v", err)
 	}
-
-	if result == "(no projects found)" {
-		t.Fatal("expected at least one project")
+	if isSentinel(result) {
+		t.Skip("the Cloud Monitoring datasource reports no projects")
 	}
 	if !strings.Contains(result, "PROJECT_ID") {
-		t.Error("expected PROJECT_ID header")
-	}
-	if !strings.Contains(result, "time-entries-live") {
-		t.Error("expected 'time-entries-live' project")
+		t.Fatalf("expected a PROJECT_ID column, got: %s", truncate(result, 200))
 	}
 
-	t.Logf("projects:\n%s", truncate(result, 500))
+	project := os.Getenv("GRAFANA_TEST_GCM_PROJECT")
+	if project == "" {
+		lines := nonEmptyLines(t, "GCMProjects", result)
+		if len(lines) < 2 {
+			t.Skip("no project rows to query with")
+		}
+		project = strings.Fields(lines[1])[0]
+	}
+
+	expr := os.Getenv("GRAFANA_TEST_GCM_EXPR")
+	if expr == "" {
+		t.Skipf("set GRAFANA_TEST_GCM_EXPR to a GCM PromQL expression to exercise queries against project %s", project)
+	}
+
+	t.Run("query", func(t *testing.T) {
+		out, err := gc.GCMQuery(ds.UID, project, expr, "", "", "", "")
+		if err != nil {
+			t.Fatalf("GCMQuery(%s, %s): %v", project, expr, err)
+		}
+		t.Logf("result preview: %s", truncate(out, 200))
+	})
+
+	t.Run("invalid_query_is_reported", func(t *testing.T) {
+		_, err := gc.GCMQuery(ds.UID, project, "this is not( valid promql", "", "", "", "")
+		if err == nil {
+			t.Fatal("expected an error for an invalid GCM expression")
+		}
+		if strings.Contains(err.Error(), "HTTP 400: {") {
+			t.Errorf("raw JSON leaked into the error instead of a message: %v", err)
+		}
+	})
 }
 
-func TestIntegrationGCMQuery(t *testing.T) {
+// ---------------------------------------------------------------------------
+// The binary itself
+// ---------------------------------------------------------------------------
+
+func TestIntegrationCLI(t *testing.T) {
 	gc := mustClient(t)
-	ds := mustFindDatasource(t, gc, "Google Cloud Monitoring", "stackdriver")
-
-	now := time.Now().UTC()
-	start := fmt.Sprintf("%d", now.Add(-1*time.Hour).UnixMilli())
-	end := fmt.Sprintf("%d", now.UnixMilli())
-
-	t.Run("basic_query", func(t *testing.T) {
-		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
-			"avg by (zone) (compute_googleapis_com:instance_cpu_utilization)",
-			start, end, "300s", "")
-		if err != nil {
-			t.Fatalf("GCMQuery: %v", err)
-		}
-		if result == "(no results)" {
-			t.Skip("no GCM data available")
-		}
-		// Matrix output should have series sections
-		if !strings.Contains(result, "──") {
-			t.Error("expected series header (──) in output")
-		}
-		if !strings.Contains(result, "TIME") {
-			t.Error("expected TIME column header")
-		}
-		if !strings.Contains(result, "VALUE") {
-			t.Error("expected VALUE column header")
-		}
-		if !strings.Contains(result, "samples") {
-			t.Error("expected 'samples' count in series header")
-		}
-		t.Logf("result preview: %s", truncate(result, 400))
-	})
-
-	t.Run("tsv_format", func(t *testing.T) {
-		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
-			"avg by (zone) (compute_googleapis_com:instance_cpu_utilization)",
-			start, end, "300s", "tsv")
-		if err != nil {
-			t.Fatalf("GCMQuery tsv: %v", err)
-		}
-		if result == "(no results)" {
-			t.Skip("no GCM data available")
-		}
-		// TSV should have tab-separated lines
-		lines := strings.Split(strings.TrimSpace(result), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "#") {
-				continue
-			}
-			if !strings.Contains(line, "\t") {
-				t.Errorf("expected tab-separated line, got: %s", line)
-				break
-			}
-		}
-	})
-
-	t.Run("bad_query", func(t *testing.T) {
-		_, err := gc.GCMQuery(ds.UID, "time-entries-live",
-			"bad_query{[", start, end, "60s", "")
-		if err == nil {
-			t.Error("expected error for bad query")
-		}
-	})
-
-	t.Run("no_results", func(t *testing.T) {
-		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
-			"nonexistent_metric_xyz_12345_gcm", start, end, "300s", "")
-		if err != nil {
-			// Some nonexistent metrics return errors, some return empty
-			t.Logf("nonexistent metric returned error (expected): %v", err)
-			return
-		}
-		if result != "(no results)" {
-			t.Errorf("expected '(no results)', got: %s", truncate(result, 100))
-		}
-	})
-
-	t.Run("defaults_without_params", func(t *testing.T) {
-		// Empty start/end/step should default to 1h range, 60s step
-		result, err := gc.GCMQuery(ds.UID, "time-entries-live",
-			"count(compute_googleapis_com:instance_cpu_utilization)",
-			"", "", "", "")
-		if err != nil {
-			t.Fatalf("GCMQuery defaults: %v", err)
-		}
-		if result == "(no results)" {
-			t.Skip("no GCM data available")
-		}
-		if !strings.Contains(result, "──") {
-			t.Error("expected series output with defaults")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Helpers (unit-testable without Grafana)
-// ---------------------------------------------------------------------------
-
-func TestFormatLabels(t *testing.T) {
-	t.Run("empty", func(t *testing.T) {
-		result := formatLabels(map[string]string{})
-		if result != "{}" {
-			t.Errorf("expected '{}', got %q", result)
-		}
-	})
-
-	t.Run("name_first", func(t *testing.T) {
-		result := formatLabels(map[string]string{
-			"__name__": "http_requests_total",
-			"method":   "GET",
-			"code":     "200",
-		})
-		if !strings.HasPrefix(result, "http_requests_total") {
-			t.Errorf("expected __name__ first, got: %s", result)
-		}
-	})
-
-	t.Run("filters_noisy_labels", func(t *testing.T) {
-		result := formatLabels(map[string]string{
-			"__name__":                           "up",
-			"job":                                "test",
-			"beta_kubernetes_io_arch":            "amd64",
-			"cloud_google_com_gke_os_distribution": "cos",
-			"topology_kubernetes_io_zone":        "us-central1-a",
-		})
-		if strings.Contains(result, "beta_kubernetes_io") {
-			t.Error("should filter beta_kubernetes_io_ prefix")
-		}
-		if strings.Contains(result, "cloud_google_com") {
-			t.Error("should filter cloud_google_com_ prefix")
-		}
-		if strings.Contains(result, "topology_kubernetes_io") {
-			t.Error("should filter topology_kubernetes_io_ prefix")
-		}
-		if !strings.Contains(result, "job=test") {
-			t.Error("should keep important label 'job'")
-		}
-		if !strings.Contains(result, "(+3 labels)") {
-			t.Errorf("expected (+3 labels) indicator, got: %s", result)
-		}
-	})
-
-	t.Run("keeps_important_labels", func(t *testing.T) {
-		result := formatLabels(map[string]string{
-			"namespace": "default",
-			"pod":       "web-abc123",
-			"container": "nginx",
-			"cluster":   "prod",
-		})
-		for _, label := range []string{"namespace=default", "pod=web-abc123", "container=nginx", "cluster=prod"} {
-			if !strings.Contains(result, label) {
-				t.Errorf("expected %q in result: %s", label, result)
-			}
-		}
-	})
-}
-
-func TestParseTimeNano(t *testing.T) {
-	t.Run("empty", func(t *testing.T) {
-		if got := parseTimeNano(""); got != "" {
-			t.Errorf("expected empty, got %q", got)
-		}
-	})
-
-	t.Run("relative_to_nanos", func(t *testing.T) {
-		result := parseTimeNano("1h")
-		ts, err := strconv.ParseInt(result, 10, 64)
-		if err != nil {
-			t.Fatalf("expected nanosecond timestamp, got %q", result)
-		}
-		expected := time.Now().UTC().Add(-1 * time.Hour).UnixNano()
-		diff := ts - expected
-		if diff < -2e9 || diff > 2e9 {
-			t.Errorf("nanosecond timestamp off by %dns", diff)
-		}
-	})
-
-	t.Run("seconds_epoch_converted_to_nanos", func(t *testing.T) {
-		result := parseTimeNano("1774452000")
-		if result != "1774452000000000000" {
-			t.Errorf("expected seconds→nanos conversion, got %q", result)
-		}
-	})
-
-	t.Run("nanos_epoch_passthrough", func(t *testing.T) {
-		input := "1774452000000000000"
-		result := parseTimeNano(input)
-		if result != input {
-			t.Errorf("expected passthrough for nano timestamp, got %q", result)
-		}
-	})
-
-	t.Run("short_number_converted", func(t *testing.T) {
-		// 10-digit timestamp (seconds)
-		result := parseTimeNano("1700000000")
-		if result != "1700000000000000000" {
-			t.Errorf("expected seconds→nanos, got %q", result)
-		}
-	})
-}
-
-func TestParseDurationSeconds(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected int64
-	}{
-		{"", -1},
-		{"5", -1},
-		{"30m", 1800},
-		{"1h", 3600},
-		{"6h", 21600},
-		{"12h", 43200},
-		{"1d", 86400},
-		{"abc", -1},
-		{"10x", -1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := parseDurationSeconds(tt.input)
-			if got != tt.expected {
-				t.Errorf("parseDurationSeconds(%q) = %d, want %d", tt.input, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestParseRelativeTime(t *testing.T) {
-	t.Run("empty", func(t *testing.T) {
-		if got := parseRelativeTime("", false); got != "" {
-			t.Errorf("expected empty, got %q", got)
-		}
-	})
-
-	t.Run("minutes_seconds", func(t *testing.T) {
-		result := parseRelativeTime("30m", false)
-		ts, err := strconv.ParseInt(result, 10, 64)
-		if err != nil {
-			t.Fatalf("expected unix timestamp, got %q", result)
-		}
-		expected := time.Now().UTC().Add(-30 * time.Minute).Unix()
-		diff := ts - expected
-		if diff < -2 || diff > 2 {
-			t.Errorf("timestamp off by %ds", diff)
-		}
-	})
-
-	t.Run("hours_seconds", func(t *testing.T) {
-		result := parseRelativeTime("2h", false)
-		ts, _ := strconv.ParseInt(result, 10, 64)
-		expected := time.Now().UTC().Add(-2 * time.Hour).Unix()
-		diff := ts - expected
-		if diff < -2 || diff > 2 {
-			t.Errorf("timestamp off by %ds", diff)
-		}
-	})
-
-	t.Run("days_seconds", func(t *testing.T) {
-		result := parseRelativeTime("1d", false)
-		ts, _ := strconv.ParseInt(result, 10, 64)
-		expected := time.Now().UTC().Add(-24 * time.Hour).Unix()
-		diff := ts - expected
-		if diff < -2 || diff > 2 {
-			t.Errorf("timestamp off by %ds", diff)
-		}
-	})
-
-	t.Run("nanoseconds", func(t *testing.T) {
-		result := parseRelativeTime("1h", true)
-		ts, err := strconv.ParseInt(result, 10, 64)
-		if err != nil {
-			t.Fatalf("expected nanosecond timestamp, got %q", result)
-		}
-		expected := time.Now().UTC().Add(-1 * time.Hour).UnixNano()
-		diff := ts - expected
-		// Allow 2 second tolerance in nanos
-		if diff < -2e9 || diff > 2e9 {
-			t.Errorf("nanosecond timestamp off by %dns", diff)
-		}
-	})
-
-	t.Run("passthrough_unix_timestamp", func(t *testing.T) {
-		if got := parseRelativeTime("1700000000", false); got != "1700000000" {
-			t.Errorf("expected passthrough, got %q", got)
-		}
-	})
-
-	t.Run("passthrough_unknown_unit", func(t *testing.T) {
-		if got := parseRelativeTime("10x", false); got != "10x" {
-			t.Errorf("expected passthrough for unknown unit, got %q", got)
-		}
-	})
-
-	t.Run("single_char", func(t *testing.T) {
-		// Single character should pass through (no num+unit to parse)
-		if got := parseRelativeTime("5", false); got != "5" {
-			t.Errorf("expected passthrough for single char, got %q", got)
-		}
-	})
-}
-
-func TestGCMIntervalMS(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected int64
-	}{
-		{"", 60000},
-		{"60s", 60000},
-		{"300s", 300000},
-		{"10s", 10000},
-		{"5m", 300000},
-		{"1h", 3600000},
-		{"1d", 86400000},
-		{"bad", 60000},
-	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := gcmIntervalMS(tt.input)
-			if got != tt.expected {
-				t.Errorf("gcmIntervalMS(%q) = %d, want %d", tt.input, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestExtractGCMError(t *testing.T) {
-	t.Run("valid_error", func(t *testing.T) {
-		input := `HTTP 400: {"results":{"A":{"error":"bad metric","status":500,"frames":[]}}}`
-		got := extractGCMError(input)
-		if got != "bad metric" {
-			t.Errorf("expected 'bad metric', got %q", got)
-		}
-	})
-
-	t.Run("no_json", func(t *testing.T) {
-		got := extractGCMError("HTTP 500: Internal Server Error")
-		if got != "" {
-			t.Errorf("expected empty, got %q", got)
-		}
-	})
-
-	t.Run("no_error_field", func(t *testing.T) {
-		input := `HTTP 200: {"results":{"A":{"status":200,"frames":[]}}}`
-		got := extractGCMError(input)
-		if got != "" {
-			t.Errorf("expected empty, got %q", got)
-		}
-	})
-
-	t.Run("invalid_json", func(t *testing.T) {
-		got := extractGCMError(`HTTP 400: {"results":{"A":{"error":"truncated...`)
-		if got != "" {
-			t.Errorf("expected empty for truncated JSON, got %q", got)
-		}
-	})
-}
-
-func TestFormatGCMResponseNulls(t *testing.T) {
-	// Simulate a GCM response with null values
-	body := `{
-		"results": {
-			"A": {
-				"status": 200,
-				"frames": [{
-					"schema": {
-						"refId": "A",
-						"meta": {"custom": {"resultType": "matrix"}},
-						"fields": [
-							{"name": "Time", "type": "time"},
-							{"name": "Value", "type": "number", "labels": {"zone": "us-central1-a"}}
-						]
-					},
-					"data": {
-						"values": [
-							[1000, 2000, 3000, 4000],
-							[1.5, null, 2.5, null]
-						]
-					}
-				}]
-			}
-		}
-	}`
-
-	t.Run("table_skips_nulls", func(t *testing.T) {
-		result, err := formatGCMResponse([]byte(body), "")
-		if err != nil {
-			t.Fatalf("formatGCMResponse: %v", err)
-		}
-		// Should show 2 samples (not 4)
-		if !strings.Contains(result, "2 samples") {
-			t.Errorf("expected '2 samples' (nulls excluded), got: %s", result)
-		}
-		// Should contain the non-null values
-		if !strings.Contains(result, "1.5") || !strings.Contains(result, "2.5") {
-			t.Errorf("expected non-null values in output: %s", result)
-		}
-	})
-
-	t.Run("tsv_skips_nulls", func(t *testing.T) {
-		result, err := formatGCMResponse([]byte(body), "tsv")
-		if err != nil {
-			t.Fatalf("formatGCMResponse tsv: %v", err)
-		}
-		lines := strings.Split(strings.TrimSpace(result), "\n")
-		// Should only have 2 data lines (nulls skipped)
-		if len(lines) != 2 {
-			t.Errorf("expected 2 TSV lines, got %d: %v", len(lines), lines)
-		}
-	})
-
-	t.Run("empty_frames", func(t *testing.T) {
-		emptyBody := `{"results": {"A": {"status": 200, "frames": []}}}`
-		result, err := formatGCMResponse([]byte(emptyBody), "")
-		if err != nil {
-			t.Fatalf("formatGCMResponse empty: %v", err)
-		}
-		if result != "(no results)" {
-			t.Errorf("expected '(no results)', got: %s", result)
-		}
-	})
-
-	t.Run("error_in_result", func(t *testing.T) {
-		errorBody := `{"results": {"A": {"status": 500, "error": "bad query", "frames": []}}}`
-		_, err := formatGCMResponse([]byte(errorBody), "")
-		if err == nil {
-			t.Error("expected error for error result")
-		}
-		if !strings.Contains(err.Error(), "bad query") {
-			t.Errorf("expected 'bad query' in error, got: %v", err)
-		}
-	})
-}
-
-func TestParseTimeMS(t *testing.T) {
-	t.Run("empty", func(t *testing.T) {
-		if got := parseTimeMS(""); got != "" {
-			t.Errorf("expected empty, got %q", got)
-		}
-	})
-
-	t.Run("relative_to_ms", func(t *testing.T) {
-		result := parseTimeMS("1h")
-		ts, err := strconv.ParseInt(result, 10, 64)
-		if err != nil {
-			t.Fatalf("expected millisecond timestamp, got %q", result)
-		}
-		expected := time.Now().UTC().Add(-1 * time.Hour).UnixMilli()
-		diff := ts - expected
-		if diff < -2000 || diff > 2000 {
-			t.Errorf("millisecond timestamp off by %dms", diff)
-		}
-	})
-
-	t.Run("seconds_epoch_converted_to_ms", func(t *testing.T) {
-		result := parseTimeMS("1774452000")
-		if result != "1774452000000" {
-			t.Errorf("expected seconds→ms conversion, got %q", result)
-		}
-	})
-
-	t.Run("passthrough_ms_timestamp", func(t *testing.T) {
-		// 13-digit ms timestamp should pass through
-		input := "1774452000000"
-		result := parseTimeMS(input)
-		if result != input {
-			t.Errorf("expected passthrough for ms timestamp, got %q", result)
-		}
-	})
-}
-
-func TestTruncate(t *testing.T) {
-	if got := truncate("hello", 10); got != "hello" {
-		t.Errorf("short string: got %q", got)
-	}
-	if got := truncate("hello world", 5); got != "hello..." {
-		t.Errorf("long string: got %q", got)
-	}
-	if got := truncate("", 5); got != "" {
-		t.Errorf("empty string: got %q", got)
-	}
-}
-
-func TestGetFlag(t *testing.T) {
-	t.Run("extracts_flag", func(t *testing.T) {
-		val, rest := getFlag([]string{"--start", "1h", "--end", "30m"}, "--start")
-		if val != "1h" {
-			t.Errorf("expected '1h', got %q", val)
-		}
-		if len(rest) != 2 || rest[0] != "--end" || rest[1] != "30m" {
-			t.Errorf("unexpected rest: %v", rest)
-		}
-	})
-
-	t.Run("extracts_equals_form", func(t *testing.T) {
-		val, rest := getFlag([]string{"--limit=50", "other"}, "--limit")
-		if val != "50" {
-			t.Errorf("expected '50', got %q", val)
-		}
-		if len(rest) != 1 || rest[0] != "other" {
-			t.Errorf("unexpected rest: %v", rest)
-		}
-	})
-
-	t.Run("missing_flag", func(t *testing.T) {
-		val, rest := getFlag([]string{"--start", "1h"}, "--end")
-		if val != "" {
-			t.Errorf("expected empty, got %q", val)
-		}
-		if len(rest) != 2 {
-			t.Errorf("expected unchanged args, got: %v", rest)
-		}
-	})
-
-	t.Run("no_mutation_of_original_args", func(t *testing.T) {
-		// This was the original bug: append mutated the shared backing array
-		original := []string{"--start", "AAA", "--end", "BBB", "--limit", "5"}
-		startVal, remaining := getFlag(original, "--start")
-		endVal, remaining := getFlag(remaining, "--end")
-		limitVal, _ := getFlag(remaining, "--limit")
-
-		if startVal != "AAA" {
-			t.Errorf("start: expected 'AAA', got %q", startVal)
-		}
-		if endVal != "BBB" {
-			t.Errorf("end: expected 'BBB', got %q", endVal)
-		}
-		if limitVal != "5" {
-			t.Errorf("limit: expected '5', got %q", limitVal)
-		}
-	})
-
-	t.Run("multiple_flags_interleaved", func(t *testing.T) {
-		args := []string{"--query", "{}", "--start", "1h", "--end", "30m", "--limit", "10"}
-		query, args := getFlag(args, "--query")
-		start, args := getFlag(args, "--start")
-		end, args := getFlag(args, "--end")
-		limit, args := getFlag(args, "--limit")
-
-		if query != "{}" {
-			t.Errorf("query: expected '{}', got %q", query)
-		}
-		if start != "1h" {
-			t.Errorf("start: expected '1h', got %q", start)
-		}
-		if end != "30m" {
-			t.Errorf("end: expected '30m', got %q", end)
-		}
-		if limit != "10" {
-			t.Errorf("limit: expected '10', got %q", limit)
-		}
-		if len(args) != 0 {
-			t.Errorf("expected empty remaining args, got: %v", args)
-		}
-	})
-}
-
-func TestIsNoisyLabel(t *testing.T) {
-	noisy := []string{
-		"addon_gke_io_foo",
-		"beta_kubernetes_io_arch",
-		"cloud_google_com_gke_nodepool",
-		"topology_kubernetes_io_zone",
-	}
-	for _, label := range noisy {
-		if !isNoisyLabel(label) {
-			t.Errorf("expected %q to be noisy", label)
-		}
-	}
-
-	clean := []string{
-		"job",
-		"namespace",
-		"pod",
-		"custom_label",
-		"http_requests_total",
-	}
-	for _, label := range clean {
-		if isNoisyLabel(label) {
-			t.Errorf("expected %q to NOT be noisy", label)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// CLI binary (end-to-end via exec)
-// ---------------------------------------------------------------------------
-
-func TestIntegrationCLIEndToEnd(t *testing.T) {
-	skipIfNoGrafana(t)
-
-	// Build the binary
-	binPath := t.TempDir() + "/grafana-cli"
-	cmd := newCmd("go", "build", "-o", binPath, ".")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build failed: %s\n%s", err, out)
-	}
+	bin := cliBinary(t)
 
 	env := append(os.Environ(),
 		"GRAFANA_URL="+os.Getenv("GRAFANA_URL"),
 		"GRAFANA_TOKEN="+os.Getenv("GRAFANA_TOKEN"),
 	)
-
 	run := func(args ...string) (string, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		c := exec.CommandContext(ctx, binPath, args...)
-		c.Env = env
-		out, err := c.CombinedOutput()
+		cmd := exec.Command(bin, args...)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
 		return string(out), err
 	}
-
-	t.Run("help", func(t *testing.T) {
-		// --help exits with 1 (usage) but should print usage text
-		out, _ := run("--help")
-		if !strings.Contains(out, "grafana-cli") {
-			t.Error("expected usage text")
-		}
-	})
 
 	t.Run("datasources", func(t *testing.T) {
 		out, err := run("datasources")
 		if err != nil {
 			t.Fatalf("datasources: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "prometheus") {
-			t.Error("expected prometheus in datasources output")
+		for _, want := range []string{"UID", "NAME", "TYPE"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("expected a %s column:\n%s", want, out)
+			}
 		}
 	})
 
-	t.Run("ds_alias", func(t *testing.T) {
-		out, err := run("ds")
+	// The uid printed by `datasources` must be accepted by the query commands:
+	// this is the round trip that broke on Grafana 13.
+	t.Run("uid_round_trip", func(t *testing.T) {
+		ds := datasourceOfType(t, gc, "prometheus")
+		out, err := run("prom", "query", ds.UID, "vector(1)")
 		if err != nil {
-			t.Fatalf("ds: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "ID") || !strings.Contains(out, "NAME") {
-			t.Error("expected table headers")
-		}
-	})
-
-	t.Run("prom_query", func(t *testing.T) {
-		out, err := run("prom", "query", "Prometheus", "count(up)")
-		if err != nil {
-			t.Fatalf("prom query: %v\n%s", err, out)
+			t.Fatalf("prom query %s: %v\n%s", ds.UID, err, out)
 		}
 		if !strings.Contains(out, "VALUE") {
-			t.Error("expected VALUE header")
+			t.Errorf("expected a VALUE column:\n%s", out)
 		}
 	})
 
-	t.Run("prom_query_range_with_flags", func(t *testing.T) {
-		out, err := run("prom", "query-range", "Prometheus", "count(up)", "--start", "1h", "--step", "15m")
+	t.Run("tsv_output_is_bare", func(t *testing.T) {
+		ds := datasourceOfType(t, gc, "prometheus")
+		out, err := run("prom", "query", ds.UID, "vector(1)", "--format", "tsv")
 		if err != nil {
-			t.Fatalf("prom query-range: %v\n%s", err, out)
+			t.Fatalf("prom query --format tsv: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "TIME") || !strings.Contains(out, "VALUE") {
-			t.Error("expected TIME/VALUE headers")
-		}
-	})
-
-	t.Run("prom_labels", func(t *testing.T) {
-		out, err := run("prom", "labels", "Prometheus")
-		if err != nil {
-			t.Fatalf("prom labels: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "__name__") {
-			t.Error("expected __name__ in labels")
-		}
-	})
-
-	t.Run("prom_label_values", func(t *testing.T) {
-		out, err := run("prom", "label-values", "Prometheus", "namespace")
-		if err != nil {
-			t.Fatalf("prom label-values: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "default") {
-			t.Error("expected 'default' namespace")
-		}
-	})
-
-	t.Run("loki_query", func(t *testing.T) {
-		out, err := run("loki", "query", "Loki", `{namespace="default"}`, "--start", "30m", "--limit", "3")
-		if err != nil {
-			t.Fatalf("loki query: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "[") {
-			t.Error("expected timestamped log lines")
-		}
-	})
-
-	t.Run("loki_labels", func(t *testing.T) {
-		out, err := run("loki", "labels", "Loki")
-		if err != nil {
-			t.Fatalf("loki labels: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "namespace") {
-			t.Error("expected 'namespace' label")
-		}
-	})
-
-	t.Run("loki_label_values", func(t *testing.T) {
-		out, err := run("loki", "label-values", "Loki", "namespace")
-		if err != nil {
-			t.Fatalf("loki label-values: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "default") {
-			t.Error("expected 'default' namespace")
-		}
-	})
-
-	t.Run("tempo_search", func(t *testing.T) {
-		out, err := run("tempo", "search", "Tempo", "--start", "1h", "--limit", "3")
-		if err != nil {
-			t.Fatalf("tempo search: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "TRACE_ID") && !strings.Contains(out, "no traces") {
-			t.Error("expected TRACE_ID header or 'no traces' message")
-		}
-	})
-
-	t.Run("gcm_projects", func(t *testing.T) {
-		out, err := run("gcm", "projects", "Google Cloud Monitoring")
-		if err != nil {
-			t.Fatalf("gcm projects: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "PROJECT_ID") {
-			t.Error("expected PROJECT_ID header")
-		}
-	})
-
-	t.Run("gcm_query", func(t *testing.T) {
-		out, err := run("gcm", "query", "Google Cloud Monitoring",
-			"count(compute_googleapis_com:instance_cpu_utilization)",
-			"--project", "time-entries-live", "--start", "1h", "--step", "300s")
-		if err != nil {
-			t.Fatalf("gcm query: %v\n%s", err, out)
-		}
-		if !strings.Contains(out, "──") && !strings.Contains(out, "no results") {
-			t.Error("expected series output or 'no results'")
-		}
-	})
-
-	t.Run("gcm_query_missing_project", func(t *testing.T) {
-		_, err := run("gcm", "query", "Google Cloud Monitoring", "up")
-		if err == nil {
-			t.Error("expected error when --project is missing")
-		}
-	})
-
-	t.Run("unknown_command", func(t *testing.T) {
-		_, err := run("bogus")
-		if err == nil {
-			t.Error("expected error for unknown command")
-		}
-	})
-
-	t.Run("missing_env", func(t *testing.T) {
-		c := newCmd(binPath, "datasources")
-		c.Env = []string{} // no GRAFANA_URL/TOKEN
-		_, err := c.CombinedOutput()
-		if err == nil {
-			t.Error("expected error when env vars are missing")
+		if strings.Contains(out, "VALUE") {
+			t.Errorf("tsv output should carry no table header:\n%s", out)
 		}
 	})
 }
 
-// newCmd creates an exec.Cmd. Extracted to keep import in one place.
-func newCmd(name string, args ...string) *exec.Cmd {
-	return exec.Command(name, args...)
+// TestIntegrationGrafanaVersion records which Grafana answered, so a failing
+// run in the version matrix is self-describing.
+func TestIntegrationGrafanaVersion(t *testing.T) {
+	gc := mustClient(t)
+
+	body, err := gc.get("/api/health")
+	if err != nil {
+		t.Skipf("/api/health is not readable with this token: %v", err)
+	}
+	t.Logf("%s health: %s", os.Getenv("GRAFANA_URL"), strings.TrimSpace(string(body)))
 }
-
-

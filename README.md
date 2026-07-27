@@ -43,7 +43,7 @@ This requires the `gcloud` CLI. The tool mints an IAP ID token via service accou
 ## Usage
 
 ```bash
-# Discover available datasources
+# Discover available datasources (the UID column is the safest selector)
 grafana-cli datasources
 
 # Prometheus
@@ -97,17 +97,85 @@ You can query production monitoring data using `grafana-cli`. Environment is pre
 5. Get trace details: `grafana-cli tempo trace <ds> <traceID>`
 ```
 
+## Datasource Argument
+
+Every command takes a datasource selector, resolved in this fixed order
+(case-insensitive): **uid → numeric id → exact name → exact type → partial name
+→ partial type**.
+
+```bash
+grafana-cli prom query dsuid-prometheus 'up'    # uid — always unambiguous
+grafana-cli prom query Prometheus 'up'          # exact name
+grafana-cli prom query prom 'up'                # partial name
+```
+
+The resolver never guesses:
+
+- A selector matching several datasources is an error listing the candidates,
+  unless exactly one of them is the Grafana default.
+- A selector matching a datasource of the wrong type (`loki query` against a
+  Prometheus datasource) is an error naming the type mismatch.
+- Unknown selectors list the datasources that would have worked.
+
+UIDs work on every supported Grafana version; the numeric id is the legacy
+Grafana < 13 identity and is only kept for convenience.
+
 ## Time Formats
 
-The `--start` and `--end` flags accept:
-- **Relative**: `30m`, `1h`, `2d` (meaning "that long ago from now")
-- **Unix timestamps**: `1711152000` (auto-converted to nanos for Loki)
-- **Nanosecond timestamps** (Loki): `1711152000000000000`
+The `--start`, `--end` and `--time` flags accept:
+- **Relative**: `90s`, `30m`, `1h`, `1h30m`, `2d`, `1w` (meaning "that long ago from now")
+- **Unix timestamps**: `1711152000`, or nanoseconds `1711152000000000000`
+- **RFC3339**: `2026-07-27T10:00:00Z`, including offsets (`2026-07-27T12:00:00+02:00`)
+  and fractional seconds
+
+Every form works with every command. Each is converted to the unit that
+datasource expects — seconds for Prometheus and Tempo, nanoseconds for Loki,
+milliseconds for Google Cloud Monitoring — so the same `--start` value produces
+the same window everywhere, which is what makes metrics, logs and traces
+comparable in one investigation.
+
+Anything else (`1hour`, `90sec`, `yesterday`) is rejected up front instead of
+being forwarded to the datasource as an opaque parse error.
+
+## Strict Argument Handling
+
+The CLI is mostly driven by agents, so input that would produce a *plausible but
+wrong* answer is rejected:
+
+| Input | Result |
+|---|---|
+| `--steps 5m` (typo) | error naming the accepted flags |
+| `--limit abc`, `--limit 0` | error (previously silently became the default) |
+| `--format json` | error listing `table, tsv` |
+| `prom query ds sum(rate(x[5m])) by (job)` unquoted | error about quoting |
+| `--query --start 1h` (missing value) | error, no accidental query |
+
+Add `--help` to any subcommand to print its usage and exit 0.
 
 Target a specific incident window with both `--start` and `--end`:
 ```bash
 grafana-cli loki query loki '{app="api"} |= "error"' --start 1774452000 --end 1774453000
 ```
+
+## Adapting to Your Environment
+
+Nothing about a particular deployment is baked in — datasources, labels and
+projects are all discovered at run time. The one presentation default that
+assumes anything is label filtering, and it is overridable:
+
+| Variable | Effect |
+|---|---|
+| `GRAFANA_HIDE_LABEL_PREFIXES` | Comma-separated label prefixes to hide from compact output. Replaces the defaults (which target Kubernetes/GKE noise). |
+| `GRAFANA_HIDE_LABEL_PREFIXES=""` | Hide nothing; show every label. |
+
+```bash
+# EC2 tags are the noise here, Kubernetes labels are not present
+export GRAFANA_HIDE_LABEL_PREFIXES="ec2_tag_,aws_"
+```
+
+Loki log lines are labelled with whichever stream labels the deployment uses:
+`namespace`/`pod`/`container` are preferred when present, otherwise the stream's
+own labels (`host`, `filename`, `unit`, ...) are shown.
 
 ## Output Formats
 

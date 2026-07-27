@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	defaultLimit   = 100
-	defaultStep    = "60s"
-	requestTimeout = 30 * time.Second
+	defaultLimit    = 100
+	defaultStep     = "60s"
+	requestTimeout  = 30 * time.Second
 	maxResponseBody = 50 * 1024 * 1024 // 50MB
 )
 
@@ -124,43 +124,157 @@ func (g *GrafanaClient) ListDatasources() ([]Datasource, error) {
 	if err := json.Unmarshal(body, &ds); err != nil {
 		return nil, fmt.Errorf("parsing datasources: %w", err)
 	}
-	sort.Slice(ds, func(i, j int) bool { return ds[i].ID < ds[j].ID })
+	// Sorted by name rather than id: the numeric id is the legacy Grafana <13
+	// identity and may be absent, which would make the listing order arbitrary.
+	sort.Slice(ds, func(i, j int) bool {
+		ni, nj := strings.ToLower(ds[i].Name), strings.ToLower(ds[j].Name)
+		if ni != nj {
+			return ni < nj
+		}
+		return ds[i].UID < ds[j].UID
+	})
 	return ds, nil
 }
 
-func (g *GrafanaClient) FindDatasource(nameOrID string, dsType string) (*Datasource, error) {
+// typeMatches reports whether ds satisfies the datasource type a command
+// requires ("prometheus", "loki", "tempo", "stackdriver"). An empty constraint
+// matches every datasource.
+func typeMatches(ds Datasource, dsType string) bool {
+	if dsType == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(ds.Type), strings.ToLower(dsType))
+}
+
+// FindDatasource resolves a datasource selector supplied on the command line.
+//
+// Selectors are matched in a fixed order so that the result is deterministic:
+//
+//  1. uid        exact, case-insensitive  — the Grafana 13 native identity
+//  2. numeric id exact                    — legacy identity, Grafana < 13 only
+//  3. name       exact, case-insensitive
+//  4. type       exact, case-insensitive
+//  5. name       substring, case-insensitive
+//  6. type       substring, case-insensitive
+//
+// dsType constrains the result to datasources of that type, at every stage. A
+// selector that unambiguously identifies a datasource of the wrong type is
+// reported as such instead of "not found", and an ambiguous selector is an
+// error listing the candidates instead of a silent arbitrary pick.
+func (g *GrafanaClient) FindDatasource(selector string, dsType string) (*Datasource, error) {
 	datasources, err := g.ListDatasources()
 	if err != nil {
 		return nil, err
 	}
+	return findDatasource(datasources, selector, dsType)
+}
 
-	// Try by ID first
-	if id, err := strconv.Atoi(nameOrID); err == nil {
-		for _, ds := range datasources {
-			if ds.ID == id {
-				return &ds, nil
-			}
-		}
+func findDatasource(all []Datasource, selector, dsType string) (*Datasource, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return nil, fmt.Errorf("empty datasource argument%s", availableHint(all, dsType))
+	}
+	sel := strings.ToLower(selector)
+	id, idErr := strconv.Atoi(selector)
+
+	stages := []struct {
+		kind  string
+		match func(Datasource) bool
+	}{
+		{"uid", func(ds Datasource) bool { return strings.EqualFold(ds.UID, selector) }},
+		{"id", func(ds Datasource) bool { return idErr == nil && ds.ID != 0 && ds.ID == id }},
+		{"name", func(ds Datasource) bool { return strings.ToLower(ds.Name) == sel }},
+		{"type", func(ds Datasource) bool { return strings.ToLower(ds.Type) == sel }},
+		{"name", func(ds Datasource) bool { return strings.Contains(strings.ToLower(ds.Name), sel) }},
+		{"type", func(ds Datasource) bool { return strings.Contains(strings.ToLower(ds.Type), sel) }},
 	}
 
-	// Then by name (case-insensitive partial match)
-	nameOrID = strings.ToLower(nameOrID)
-	for _, ds := range datasources {
-		if strings.ToLower(ds.Name) == nameOrID || strings.Contains(strings.ToLower(ds.Name), nameOrID) {
-			if dsType == "" || strings.Contains(strings.ToLower(ds.Type), dsType) {
-				return &ds, nil
+	for _, stage := range stages {
+		var matched, typed []Datasource
+		for _, ds := range all {
+			if !stage.match(ds) {
+				continue
+			}
+			matched = append(matched, ds)
+			if typeMatches(ds, dsType) {
+				typed = append(typed, ds)
 			}
 		}
-	}
-
-	// Then by type if nameOrID matches a type
-	for _, ds := range datasources {
-		if strings.Contains(strings.ToLower(ds.Type), nameOrID) {
+		switch {
+		case len(matched) == 0:
+			continue
+		case len(typed) == 1:
+			ds := typed[0]
 			return &ds, nil
+		case len(typed) == 0:
+			// The selector names real datasources, all of the wrong type. Only
+			// worth reporting when it is unambiguous; otherwise keep looking.
+			if len(matched) == 1 {
+				return nil, fmt.Errorf("datasource %q (%s) is of type %q, but this command requires a %q datasource%s",
+					matched[0].Name, matched[0].UID, matched[0].Type, dsType, availableHint(all, dsType))
+			}
+			continue
+		default:
+			// Several equally good candidates. Prefer the default datasource if
+			// exactly one of them is marked as such, otherwise refuse to guess.
+			var defaults []Datasource
+			for _, ds := range typed {
+				if ds.IsDefault {
+					defaults = append(defaults, ds)
+				}
+			}
+			if len(defaults) == 1 {
+				fmt.Fprintf(os.Stderr, "note: %q matches %d datasources by %s; using the default one (%s, uid=%s)\n",
+					selector, len(typed), stage.kind, defaults[0].Name, defaults[0].UID)
+				ds := defaults[0]
+				return &ds, nil
+			}
+			return nil, fmt.Errorf("datasource %q is ambiguous — it matches %d datasources by %s:\n%s\n  pass a uid to select exactly one",
+				selector, len(typed), stage.kind, datasourceList(typed))
 		}
 	}
 
-	return nil, fmt.Errorf("datasource %q not found (use 'datasources' to list available ones)", nameOrID)
+	return nil, fmt.Errorf("datasource %q not found%s", selector, availableHint(all, dsType))
+}
+
+// maxHintedDatasources caps how many datasources are echoed back in an error.
+const maxHintedDatasources = 25
+
+func datasourceList(ds []Datasource) string {
+	var sb strings.Builder
+	for i, d := range ds {
+		if i == maxHintedDatasources {
+			fmt.Fprintf(&sb, "    ... and %d more (run 'grafana-cli datasources')", len(ds)-i)
+			break
+		}
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(&sb, "    %-22s %s (%s)", d.UID, d.Name, d.Type)
+	}
+	return sb.String()
+}
+
+// availableHint lists the datasources a failed selector could have matched, so
+// that a caller can retry without a second round trip.
+func availableHint(all []Datasource, dsType string) string {
+	var candidates []Datasource
+	for _, ds := range all {
+		if typeMatches(ds, dsType) {
+			candidates = append(candidates, ds)
+		}
+	}
+	if len(candidates) == 0 {
+		if dsType != "" {
+			return fmt.Sprintf("\n  no %s datasources are configured (run 'grafana-cli datasources' to list all types)", dsType)
+		}
+		return "\n  no datasources are configured"
+	}
+	label := "available datasources"
+	if dsType != "" {
+		label = fmt.Sprintf("available %s datasources", dsType)
+	}
+	return fmt.Sprintf("\n  %s:\n%s", label, datasourceList(candidates))
 }
 
 func (g *GrafanaClient) proxyPath(dsUID string, subpath string) string {
